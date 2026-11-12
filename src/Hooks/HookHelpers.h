@@ -42,10 +42,12 @@ void MarkEmptiedModuleChrome(NSArray* items, NSMutableIndexSet* removed);
 // Live square-avatar restyling (Avatars.x)
 void applySquareAvatarsSetting(void);
 
-// Unified profile Media timeline (ProfileMedia.x / Timeline.x)
-void BHTagProfileMediaTimeline(id viewController);
-BOOL BHTimelineIsProfileMediaOnly(id viewController);
-void BHTimelineScheduleProfileMediaScan(id viewController);
+// Native Photos + Videos presentation (ProfileMedia.x / Timeline.x).
+// nil means the controller is not participating in the native media union.
+NSArray* BHProfileMediaNativeSections(id viewController, NSArray* sections);
+id BHProfileMediaReconfigureIdentifiers(NSArray* sections, id nativeIdentifiers);
+void BHProfileMediaWillApplySections(id viewController);
+void BHProfileMediaDidApplySections(id viewController);
 
 NSString* formatNumberWithSuffix(long long number);
 
@@ -86,3 +88,4 @@ BOOL nfb_boolIvar(id object, const char* name, BOOL fallback);
 void nfb_setBoolIvar(id object, const char* name, BOOL value);
 
 id nfb_objectIvar(id object, const char* name);
+
