@@ -59,7 +59,13 @@ static T1ProfileContentMainEntry* ProfileMediaEntryForProvider(
         return nil;
     }
 
-    id postsEntry = ProfileMediaObjectValue(provider, @selector(allPostsEntry));
+    // The native Tweets & replies entry covers media the profile owner
+    // posted in replies as well as standalone posts.
+    SEL repliesEntrySelector = NSSelectorFromString(@"tweetsAndRepliesEntry");
+    id postsEntry = ProfileMediaObjectValue(provider, repliesEntrySelector);
+    if (!postsEntry) {
+        postsEntry = ProfileMediaObjectValue(provider, @selector(allPostsEntry));
+    }
     id originalFactory =
         ProfileMediaObjectValue(postsEntry, @selector(viewControllerCreateBlock));
     if (!postsEntry || !originalFactory ||
