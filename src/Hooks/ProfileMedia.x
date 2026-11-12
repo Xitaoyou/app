@@ -56,7 +56,8 @@ static unsigned long long NativeMediaStatusID(id item) {
 // adapterWasUsedByURTViewController: binding must continue to target that
 // source's loader, not the other media query.
 static id NativeMediaWrappedItem(id item, UIViewController* source,
-                                 NSUInteger sourceIndex, NSUInteger position) {
+                                 NSUInteger sourceIndex, NSUInteger position,
+                                 UIViewController* presentation) {
     id model = unwrapDataViewItem(item);
     Class wrapperClass = objc_getClass("TFNDataViewItem");
     if (!wrapperClass) return item;
@@ -69,6 +70,18 @@ static id NativeMediaWrappedItem(id item, UIViewController* source,
     SEL adapterSelector = @selector(registeredDataViewAdapterForItem:);
     if (!adapter && [source respondsToSelector:adapterSelector]) {
         adapter = ((id (*)(id, SEL, id))objc_msgSend)(source, adapterSelector, model);
+    }
+    // Both native queries produce URTTimelineStatusItemViewModel. The Videos
+    // controller registers ProfileVideoTableAdapter for that same model, which
+    // renders the compact video list. Resolve the Photos controller's standard
+    // tweet adapter for video posts; cursors keep their source-bound adapter.
+    Class statusClass = objc_getClass("URTTimelineStatusItemViewModel");
+    Class postAdapterClass = objc_getClass("T1StatusTableRowAdapter");
+    if (sourceIndex == 1 && statusClass && [model isKindOfClass:statusClass] &&
+        postAdapterClass && [presentation respondsToSelector:adapterSelector]) {
+        id postAdapter = ((id (*)(id, SEL, id))objc_msgSend)(
+            presentation, adapterSelector, model);
+        if ([postAdapter isKindOfClass:postAdapterClass]) adapter = postAdapter;
     }
     MediaSetValue(wrapper, @selector(setDataViewAdapter:), adapter);
     if (nativeWrapper) {
@@ -121,7 +134,7 @@ static id NativeMediaWrappedItem(id item, UIViewController* source,
                 [seenPosts addObject:key];
             }
             NFBProfileMediaRow* row = [NFBProfileMediaRow new];
-            row.item = NativeMediaWrappedItem(item, controller, sourceIndex, position);
+            row.item = NativeMediaWrappedItem(item, controller, sourceIndex, position, self.photos);
             row.order = statusID ? statusID :
                 (previousPost == ULLONG_MAX ? ULLONG_MAX : previousPost - 1);
             row.source = sourceIndex;
