@@ -37,11 +37,6 @@ on:
         default: ""
         required: false
         type: string
-      upload_artifact:
-        description: "Upload IPA as a GitHub Actions artifact (public)"
-        default: false
-        required: false
-        type: boolean
       create_release:
         description: "Create a draft release (private until published)"
         default: true
@@ -191,14 +186,6 @@ jobs:
         run: |
           echo "package=$(ls -t main/packages | head -n1)" >> "$GITHUB_OUTPUT"
 
-      - name: Upload Artifact
-        if: ${{ inputs.upload_artifact }}
-        uses: actions/upload-artifact@v7
-        with:
-          name: ${{ steps.tweak_info.outputs.name }}_${{ steps.tweak_info.outputs.version }}
-          path: ${{ github.workspace }}/main/packages/${{ steps.package_name.outputs.package }}
-          archive: false
-          if-no-files-found: error
 
       - name: Create Draft Release
         if: ${{ inputs.create_release }}
