@@ -402,77 +402,56 @@ static BOOL MediaTypeIsSupported(id media) {
     return NO;
 }
 
-static BOOL TimelineObjectContainsMedia(id object, NSHashTable* visited, NSUInteger depth) {
-    if (!object || depth > 5 || [visited containsObject:object]) {
-        return NO;
-    }
-    [visited addObject:object];
+// Inspect only the status's own entity set. Following quotedStatusViewModel,
+ // retweetingStatus or other nested models would incorrectly attribute another
+ // author's media to this post.
+ static BOOL TimelineEntitySetHasMedia(id entities) {
+     if (!entities) {
+         return NO;
+     }
 
-    if ([object isKindOfClass:[NSArray class]] || [object isKindOfClass:[NSSet class]]) {
-        for (id item in object) {
-            if (TimelineObjectContainsMedia(item, visited, depth + 1)) {
-                return YES;
-            }
-        }
-        return NO;
-    }
+     id media = nil;
+     if ([entities isKindOfClass:[NSDictionary class]]) {
+         media = entities[@"media"];
+     } else if ([entities isKindOfClass:[NSArray class]] ||
+                [entities isKindOfClass:[NSSet class]]) {
+         media = entities;
+     } else if ([entities respondsToSelector:@selector(media)]) {
+         media = MediaObjectValue(entities, @selector(media));
+     }
 
-    if ([object isKindOfClass:[NSDictionary class]]) {
-        id entities = object[@"extended_entities"] ?: object[@"entities"] ?: object;
-        id media = [entities isKindOfClass:[NSDictionary class]] ? entities[@"media"] : nil;
-        if (TimelineObjectContainsMedia(media, visited, depth + 1)) {
-            return YES;
-        }
-        if (MediaTypeIsSupported(object)) {
-            return YES;
-        }
-        return NO;
-    }
+     if ([media isKindOfClass:[NSArray class]] || [media isKindOfClass:[NSSet class]]) {
+         for (id item in media) {
+             if (MediaTypeIsSupported(item)) {
+                 return YES;
+             }
+         }
+         return NO;
+     }
+     return MediaTypeIsSupported(media);
+ }
 
-    if (MediaTypeIsSupported(object)) {
-        return YES;
-    }
+ static BOOL TimelineItemHasMedia(id item) {
+     id viewModel = unwrapDataViewItem(item);
+     if (!viewModel) {
+         return NO;
+     }
 
-    for (NSString* entitySelectorName in @[@"entities", @"extendedEntities",
-                                           @"mediaEntities"]) {
-        id entities = MediaObjectValue(object, NSSelectorFromString(entitySelectorName));
-        if (!entities) {
-            continue;
-        }
+     // A repost is not media authored by the profile owner.
+     if (ItemRespondsAndInvokesBOOL(viewModel, @selector(isRetweet))) {
+         return NO;
+     }
 
-        id media = MediaObjectValue(entities, @selector(media));
-        if (TimelineObjectContainsMedia(media ?: entities, visited, depth + 1)) {
-            return YES;
-        }
-    }
+     id entities = nil;
+     if ([viewModel isKindOfClass:[NSDictionary class]]) {
+         entities = viewModel[@"extended_entities"] ?: viewModel[@"entities"];
+     } else {
+         entities = MediaObjectValue(viewModel, @selector(entities));
+     }
+     return TimelineEntitySetHasMedia(entities);
+ }
 
-    for (NSString* nestedSelectorName in @[@"mediaEntity", @"status", @"retweetedStatus",
-                                           @"retweetStatus", @"quotedStatus",
-                                           @"quotedStatusViewModel",
-                                           @"quotedTweetViewModel",
-                                           @"retweetedStatusViewModel",
-                                           @"statusViewModel", @"tweet",
-                                           @"tweetItem", @"tweetViewModel",
-                                           @"originalStatus", @"underlyingStatus"]) {
-        id nested = MediaObjectValue(object, NSSelectorFromString(nestedSelectorName));
-        if (nested && nested != object &&
-            TimelineObjectContainsMedia(nested, visited, depth + 1)) {
-            return YES;
-        }
-    }
-
-    return NO;
-}
-
-static BOOL TimelineItemHasMedia(id item) {
-    id viewModel = unwrapDataViewItem(item);
-    NSHashTable* visited =
-        [NSHashTable hashTableWithOptions:NSPointerFunctionsObjectPointerPersonality |
-                                          NSPointerFunctionsStrongMemory];
-    return TimelineObjectContainsMedia(viewModel, visited, 0);
-}
-
-// Everything the per-item filters need to know about one section update: which
+ // Everything the per-item filters need to know about one section update: which
 // hide toggles are on, which screen the timeline is being shown on, and the
 // conversation lookups those two imply. Adding a filter or a surface means
 // adding a property here, a line in +contextForDataViewController: and a line
