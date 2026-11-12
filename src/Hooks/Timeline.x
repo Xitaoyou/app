@@ -893,6 +893,13 @@ static UIScrollView* ProfileMediaScrollView(UIViewController* viewController) {
 // scroll, nudge that same delegate once so sparse media timelines can scan
 // additional pages without changing the Posts and Replies timelines.
 void BHTimelineScheduleProfileMediaScan(id object) {
+    if (!NSThread.isMainThread) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            BHTimelineScheduleProfileMediaScan(object);
+        });
+        return;
+    }
+
     if (!BHTimelineIsProfileMediaOnly(object) ||
         ![object isKindOfClass:[TFNItemsDataViewController class]]) {
         return;
