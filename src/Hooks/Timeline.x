@@ -55,6 +55,10 @@ static BOOL IsInEditHistory(UIViewController* viewController) {
 }
 
 static const void* ConversationOpenedFromProfileKey = &ConversationOpenedFromProfileKey;
+static const void* ProfileMediaTimelineKey = &ProfileMediaTimelineKey;
+static const void* ProfileMediaScanPendingKey = &ProfileMediaScanPendingKey;
+static const void* ProfileMediaScanCountKey = &ProfileMediaScanCountKey;
+static const void* ProfileMediaLastScanKey = &ProfileMediaLastScanKey;
 
 static BOOL StringSuggestsProfile(id value) {
     if (![value isKindOfClass:[NSString class]]) {
@@ -119,6 +123,35 @@ static BOOL IsInProfileOriginConversation(UIViewController* viewController) {
         } else {
             break;
         }
+    }
+
+    return NO;
+}
+
+void BHTagProfileMediaTimeline(id object) {
+    if (![object isKindOfClass:[UIViewController class]]) {
+        return;
+    }
+
+    UIViewController* viewController = object;
+    objc_setAssociatedObject(viewController, ProfileMediaTimelineKey, @YES,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    for (UIViewController* child in viewController.childViewControllers) {
+        BHTagProfileMediaTimeline(child);
+    }
+}
+
+BOOL BHTimelineIsProfileMediaOnly(id object) {
+    if (![object isKindOfClass:[UIViewController class]]) {
+        return NO;
+    }
+
+    UIViewController* viewController = object;
+    for (NSUInteger depth = 0; viewController && depth < 32; depth++) {
+        if (objc_getAssociatedObject(viewController, ProfileMediaTimelineKey)) {
+            return YES;
+        }
+        viewController = viewController.parentViewController ?: viewController.navigationController;
     }
 
     return NO;
@@ -342,6 +375,103 @@ static BOOL ItemIsRetweet(id viewModel) {
     return YES;
 }
 
+static id MediaObjectValue(id object, SEL selector) {
+    if (!object || ![object respondsToSelector:selector]) {
+        return nil;
+    }
+
+    return ((id (*)(id, SEL))objc_msgSend)(object, selector);
+}
+
+static BOOL MediaTypeIsSupported(id media) {
+    if ([media isKindOfClass:[NSDictionary class]]) {
+        NSString* type = [media[@"type"] isKindOfClass:[NSString class]]
+                             ? [media[@"type"] lowercaseString]
+                             : nil;
+        return [type isEqualToString:@"photo"] || [type isEqualToString:@"video"] ||
+               [type isEqualToString:@"animated_gif"] || [type isEqualToString:@"gif"];
+    }
+
+    SEL mediaTypeSelector = @selector(mediaType);
+    if ([media respondsToSelector:mediaTypeSelector]) {
+        NSInteger mediaType =
+            ((NSInteger (*)(id, SEL))objc_msgSend)(media, mediaTypeSelector);
+        return mediaType == 1 || mediaType == 2 || mediaType == 3;
+    }
+
+    return NO;
+}
+
+static BOOL TimelineObjectContainsMedia(id object, NSHashTable* visited, NSUInteger depth) {
+    if (!object || depth > 5 || [visited containsObject:object]) {
+        return NO;
+    }
+    [visited addObject:object];
+
+    if ([object isKindOfClass:[NSArray class]] || [object isKindOfClass:[NSSet class]]) {
+        for (id item in object) {
+            if (TimelineObjectContainsMedia(item, visited, depth + 1)) {
+                return YES;
+            }
+        }
+        return NO;
+    }
+
+    if ([object isKindOfClass:[NSDictionary class]]) {
+        id entities = object[@"extended_entities"] ?: object[@"entities"] ?: object;
+        id media = [entities isKindOfClass:[NSDictionary class]] ? entities[@"media"] : nil;
+        if (TimelineObjectContainsMedia(media, visited, depth + 1)) {
+            return YES;
+        }
+        if (MediaTypeIsSupported(object)) {
+            return YES;
+        }
+        return NO;
+    }
+
+    if (MediaTypeIsSupported(object)) {
+        return YES;
+    }
+
+    for (NSString* entitySelectorName in @[@"entities", @"extendedEntities",
+                                           @"mediaEntities"]) {
+        id entities = MediaObjectValue(object, NSSelectorFromString(entitySelectorName));
+        if (!entities) {
+            continue;
+        }
+
+        id media = MediaObjectValue(entities, @selector(media));
+        if (TimelineObjectContainsMedia(media ?: entities, visited, depth + 1)) {
+            return YES;
+        }
+    }
+
+    for (NSString* nestedSelectorName in @[@"mediaEntity", @"status", @"retweetedStatus",
+                                           @"retweetStatus", @"quotedStatus",
+                                           @"quotedStatusViewModel",
+                                           @"quotedTweetViewModel",
+                                           @"retweetedStatusViewModel",
+                                           @"statusViewModel", @"tweet",
+                                           @"tweetItem", @"tweetViewModel",
+                                           @"originalStatus", @"underlyingStatus"]) {
+        id nested = MediaObjectValue(object, NSSelectorFromString(nestedSelectorName));
+        if (nested && nested != object &&
+            TimelineObjectContainsMedia(nested, visited, depth + 1)) {
+            return YES;
+        }
+    }
+
+    return NO;
+}
+
+static BOOL TimelineItemHasMedia(id item) {
+    id viewModel = unwrapDataViewItem(item);
+    NSHashTable* visited =
+        [NSHashTable hashTableWithOptions:NSPointerFunctionsObjectPointerPersonality |
+                                          NSPointerFunctionsStrongMemory];
+    return TimelineObjectContainsMedia(viewModel, visited, 0);
+}
+
 // Everything the per-item filters need to know about one section update: which
 // hide toggles are on, which screen the timeline is being shown on, and the
 // conversation lookups those two imply. Adding a filter or a surface means
@@ -367,6 +497,7 @@ static BOOL ItemIsRetweet(id viewModel) {
 @property (nonatomic) BOOL inSearch;
 @property (nonatomic) BOOL inEditHistory;
 @property (nonatomic) BOOL inNotifications;
+@property (nonatomic) BOOL profileMediaOnly;
 
 // Conversation lookups, filled in by -resolveConversationLookupsInSections:
 // once per section update and only when hiding verified replies needs them.
@@ -438,6 +569,10 @@ static BOOL BHShouldHideVerifiedItem(id viewModel, BHTimelineFilterContext* cont
 static BOOL ShouldHideTimelineItem(id item, BHTimelineFilterContext* context) {
     id viewModel = unwrapDataViewItem(item);
     NSString* className = NSStringFromClass([viewModel classForCoder]);
+
+    if (context.profileMediaOnly && !TimelineItemHasMedia(viewModel)) {
+        return YES;
+    }
 
     if (context.hideVerified && BHShouldHideVerifiedItem(viewModel, context)) {
         return YES;
@@ -514,6 +649,12 @@ static NSCache<NSString*, NSNumber*>* TimelineVerdictCacheForContext(
 
 static BOOL MemoizedShouldHideTimelineItem(id item, NSCache<NSString*, NSNumber*>* cache,
                                            BHTimelineFilterContext* context) {
+    if (context.profileMediaOnly) {
+        // Entity hydration can update a status without changing its timeline
+        // entry ID, so media verdicts must be re-evaluated on section updates.
+        return ShouldHideTimelineItem(item, context);
+    }
+
     NSString* entryID = ItemEntryID(unwrapDataViewItem(item));
     if (!entryID) {
         return ShouldHideTimelineItem(item, context);
@@ -591,6 +732,7 @@ static NSSet<NSNumber*>* ConversationAuthorRepliedToUserIDs(NSArray* sections,
     context.inConversation =
         IsInHierarchyOfClass(dataViewController, @"T1ConversationContainerViewController");
     context.inProfile = IsInHierarchyOfClass(dataViewController, @"T1ProfileViewController");
+    context.profileMediaOnly = BHTimelineIsProfileMediaOnly(dataViewController);
     context.openedFromProfile = IsInProfileOriginConversation(dataViewController);
     context.inSearch = IsInHierarchyOfClass(dataViewController, @"TTSSearchContainerViewControllerV2") || IsInHierarchyOfClass(dataViewController, @"TTSSearchContainerViewController");
     context.inEditHistory = IsInEditHistory(dataViewController);
@@ -614,7 +756,8 @@ static NSSet<NSNumber*>* ConversationAuthorRepliedToUserIDs(NSArray* sections,
 
 - (BOOL)shouldFilter {
     return self.hideWhoToFollow || self.hidePrompts || self.hideVerified ||
-           self.hideQuoteTweets || self.hideRetweets || self.hideBlockedRetweets || self.inConversation;
+           self.hideQuoteTweets || self.hideRetweets || self.hideBlockedRetweets ||
+           self.inConversation || self.profileMediaOnly;
 }
 
 - (void)resolveConversationLookupsInSections:(NSArray*)sections {
@@ -644,6 +787,7 @@ static NSSet<NSNumber*>* ConversationAuthorRepliedToUserIDs(NSArray* sections,
            self.hideRetweets == other.hideRetweets &&
            self.conversationRootUserID == other.conversationRootUserID &&
            self.inEditHistory == other.inEditHistory &&
+           self.profileMediaOnly == other.profileMediaOnly &&
            (self.authorRepliedToUserIDs == other.authorRepliedToUserIDs ||
             [self.authorRepliedToUserIDs isEqualToSet:other.authorRepliedToUserIDs]);
 }
@@ -697,6 +841,155 @@ static NSArray* FilteredTimelineSections(TFNItemsDataViewController* dataViewCon
     }
 
     return modified ? [filteredSections copy] : sections;
+}
+
+static NSUInteger ProfileMediaCountInSections(NSArray* sections) {
+    NSUInteger count = 0;
+    for (id section in sections) {
+        if (![section isKindOfClass:[NSArray class]]) {
+            continue;
+        }
+        for (id item in section) {
+            if (TimelineItemHasMedia(item)) {
+                count++;
+            }
+        }
+    }
+    return count;
+}
+
+static UIScrollView* ProfileMediaScrollView(UIViewController* viewController) {
+    if ([viewController respondsToSelector:@selector(tableView)]) {
+        id scrollView = MediaObjectValue(viewController, @selector(tableView));
+        if ([scrollView isKindOfClass:[UIScrollView class]]) {
+            return scrollView;
+        }
+    }
+    if ([viewController respondsToSelector:@selector(collectionView)]) {
+        id scrollView = MediaObjectValue(viewController, @selector(collectionView));
+        if ([scrollView isKindOfClass:[UIScrollView class]]) {
+            return scrollView;
+        }
+    }
+
+    NSMutableArray<UIView*>* pending = [NSMutableArray array];
+    if (viewController.isViewLoaded && viewController.view) {
+        [pending addObject:viewController.view];
+    }
+    while (pending.count) {
+        UIView* current = pending.firstObject;
+        [pending removeObjectAtIndex:0];
+        if ([current isKindOfClass:[UITableView class]] ||
+            [current isKindOfClass:[UICollectionView class]]) {
+            return (UIScrollView*)current;
+        }
+        [pending addObjectsFromArray:current.subviews];
+    }
+    return nil;
+}
+
+// The profile timeline requests its next URT page when its scroll delegate
+// reaches the bottom. When filtering leaves the initial page too short to
+// scroll, nudge that same delegate once so sparse media timelines can scan
+// additional pages without changing the Posts and Replies timelines.
+void BHTimelineScheduleProfileMediaScan(id object) {
+    if (!BHTimelineIsProfileMediaOnly(object) ||
+        ![object isKindOfClass:[TFNItemsDataViewController class]]) {
+        return;
+    }
+
+    TFNItemsDataViewController* viewController = object;
+    if (!viewController.isViewLoaded || !viewController.view.window) {
+        return;
+    }
+
+    NSArray* sections = viewController.sections;
+    NSUInteger mediaCount = ProfileMediaCountInSections(sections);
+    if (mediaCount >= 3) {
+        return;
+    }
+
+    NSUInteger scanCount = [objc_getAssociatedObject(viewController,
+                                                       ProfileMediaScanCountKey)
+                                unsignedIntegerValue];
+    if (scanCount >= 16 ||
+        [objc_getAssociatedObject(viewController, ProfileMediaScanPendingKey) boolValue]) {
+        return;
+    }
+
+    CFTimeInterval lastScan =
+        [objc_getAssociatedObject(viewController, ProfileMediaLastScanKey) doubleValue];
+    if (CFAbsoluteTimeGetCurrent() - lastScan < 1.2) {
+        return;
+    }
+
+    UIScrollView* scrollView = ProfileMediaScrollView(viewController);
+    SEL didScrollSelector = @selector(scrollViewDidScroll:);
+    if (!scrollView ||
+        ![viewController respondsToSelector:didScrollSelector] ||
+        scrollView.isTracking || scrollView.isDragging || scrollView.isDecelerating) {
+        return;
+    }
+
+    CGFloat visibleHeight = MAX(1.0, scrollView.bounds.size.height);
+    if (mediaCount > 0 && scrollView.contentSize.height > visibleHeight + 2.0) {
+        return;
+    }
+
+    objc_setAssociatedObject(viewController, ProfileMediaScanPendingKey, @YES,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        objc_setAssociatedObject(viewController, ProfileMediaScanPendingKey, nil,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+        if (!viewController.view.window || scrollView.isTracking ||
+            scrollView.isDragging || scrollView.isDecelerating) {
+            return;
+        }
+
+        NSArray* currentSections = viewController.sections;
+        NSUInteger currentMediaCount = ProfileMediaCountInSections(currentSections);
+        if (currentMediaCount >= 3) {
+            return;
+        }
+
+        NSUInteger currentScanCount =
+            [objc_getAssociatedObject(viewController, ProfileMediaScanCountKey)
+                unsignedIntegerValue];
+        if (currentScanCount >= 16) {
+            return;
+        }
+
+        CGFloat bottomY = MAX(-scrollView.adjustedContentInset.top,
+                              scrollView.contentSize.height - scrollView.bounds.size.height +
+                                  scrollView.adjustedContentInset.bottom);
+        CGPoint oldOffset = scrollView.contentOffset;
+        CGPoint bottomOffset = CGPointMake(oldOffset.x, bottomY);
+
+        objc_setAssociatedObject(viewController, ProfileMediaScanCountKey,
+                                 @(currentScanCount + 1),
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(viewController, ProfileMediaLastScanKey,
+                                 @(CFAbsoluteTimeGetCurrent()),
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+        if (fabs(oldOffset.y - bottomOffset.y) > 0.5) {
+            [scrollView setContentOffset:bottomOffset animated:NO];
+        } else {
+            ((void (*)(id, SEL, id))objc_msgSend)(viewController, didScrollSelector,
+                                                   scrollView);
+        }
+
+        if (fabs(oldOffset.y - bottomOffset.y) > 0.5) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                if (!scrollView.isTracking && !scrollView.isDragging &&
+                    fabs(scrollView.contentOffset.y - bottomOffset.y) < 1.0) {
+                    [scrollView setContentOffset:oldOffset animated:NO];
+                }
+            });
+        }
+    });
 }
 
 // MARK: - Videos for you module
@@ -765,6 +1058,7 @@ static id RemoveVideoCarouselEntries(id node, BOOL* removed) {
 
 - (void)setSections:(NSArray*)sections restoreScrollPosition:(BOOL)restoreScrollPosition {
     %orig(FilteredTimelineSections(self, sections), restoreScrollPosition);
+    BHTimelineScheduleProfileMediaScan(self);
 }
 
 - (void)updateSections:(NSArray*)sections
@@ -772,6 +1066,12 @@ static id RemoveVideoCarouselEntries(id node, BOOL* removed) {
               withRowAnimation:(long long)animation
                     completion:(id)completion {
     %orig(FilteredTimelineSections(self, sections), identifiers, animation, completion);
+    BHTimelineScheduleProfileMediaScan(self);
+}
+
+- (void)dataViewDidDisplay {
+    %orig;
+    BHTimelineScheduleProfileMediaScan(self);
 }
 
 %end

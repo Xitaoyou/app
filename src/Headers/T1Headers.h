@@ -152,9 +152,30 @@
 @end
 
 // Hooked for unrounded tweet/post count
+@interface T1ProfileContentEntry : NSObject
+@property (copy, nonatomic) id viewControllerCreateBlock;
+@property (readonly, nonatomic) UIViewController* cachedViewControllerInstance;
+- (UIViewController*)viewController;
+- (BOOL)hasCachedViewController;
+- (void)removeCachedViewControllerIfNeeded;
+@end
+
+@interface T1ProfileContentMainEntry : T1ProfileContentEntry
+@property (copy, nonatomic) NSString* title;
+@property (copy, nonatomic) NSString* subtitle;
+@property (copy, nonatomic) NSString* menuTitle;
+@property (copy, nonatomic) NSString* iconName;
+@property (copy, nonatomic) id titleReturnBlock;
+@property (copy, nonatomic) id subtitleReturnBlock;
+@end
+
 @interface T1ProfileDisplayNormalMainContentProvider : NSObject
 @property (retain, nonatomic) T1ProfileUserViewModel* viewModel;
 - (id)_tweetsSubtitle;
+- (id)allPostsEntry;
+- (id)photoEntry;
+- (id)videoEntry;
+- (id)contentMainEntries;
 @end
 
 #pragma mark - Status views

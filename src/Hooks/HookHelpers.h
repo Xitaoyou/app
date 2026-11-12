@@ -42,6 +42,11 @@ void MarkEmptiedModuleChrome(NSArray* items, NSMutableIndexSet* removed);
 // Live square-avatar restyling (Avatars.x)
 void applySquareAvatarsSetting(void);
 
+// Unified profile Media timeline (ProfileMedia.x / Timeline.x)
+void BHTagProfileMediaTimeline(id viewController);
+BOOL BHTimelineIsProfileMediaOnly(id viewController);
+void BHTimelineScheduleProfileMediaScan(id viewController);
+
 NSString* formatNumberWithSuffix(long long number);
 
 bool NFBLiquidGlassEnabled(void);
