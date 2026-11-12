@@ -127,8 +127,17 @@ jobs:
         run: |
           wget --quiet "$IPA_URL" -O main/packages/com.atebits.Tweetie2.ipa
           unzip -q main/packages/com.atebits.Tweetie2.ipa -d main/tmp
-          X_VERSION=$(grep -A 1 '<key>CFBundleShortVersionString</key>' main/tmp/Payload/Twitter.app/Info.plist |
-            grep '<string>' | awk -F'[><]' '{print $3}')
+          INFO_PLIST="main/tmp/Payload/Twitter.app/Info.plist"
+          BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$INFO_PLIST")
+          X_VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$INFO_PLIST")
+          if [ "$BUNDLE_ID" != "com.atebits.Tweetie2" ]; then
+            echo "::error::Expected bundle ID com.atebits.Tweetie2, got $BUNDLE_ID."
+            exit 1
+          fi
+          if [ "$X_VERSION" != "12.42.1" ]; then
+            echo "::error::Expected X version 12.42.1, got $X_VERSION."
+            exit 1
+          fi
           echo "version=${X_VERSION}" >> "$GITHUB_OUTPUT"
           echo "$X_VERSION"
         env:
