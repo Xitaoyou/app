@@ -900,8 +900,9 @@ void BHTimelineScheduleProfileMediaScan(id object) {
         return;
     }
 
-    if (!BHTimelineIsProfileMediaOnly(object) ||
-        ![object isKindOfClass:[TFNItemsDataViewController class]]) {
+    Class dataViewControllerClass = objc_getClass("TFNItemsDataViewController");
+    if (!BHTimelineIsProfileMediaOnly(object) || !dataViewControllerClass ||
+        ![object isKindOfClass:dataViewControllerClass]) {
         return;
     }
 
