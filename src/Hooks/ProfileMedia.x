@@ -9,8 +9,6 @@
 
 #import "HookHelpers.h"
 
-static const void* ProfileMediaEntryKey = &ProfileMediaEntryKey;
-
 static id ProfileMediaObjectValue(id object, SEL selector) {
     if (!object || ![object respondsToSelector:selector]) {
         return nil;
@@ -43,13 +41,23 @@ static BOOL ProfileMediaEntryIsSplitMedia(id entry, id photoEntry, id videoEntry
            [title isEqualToString:@"media"];
 }
 
+// Reuse one of the provider's initialized native entries. A freshly allocated
+// T1ProfileContentMainEntry lacks private state that the profile controller
+// expects when it builds and selects the tabs.
 static T1ProfileContentMainEntry* ProfileMediaEntryForProvider(
     T1ProfileDisplayNormalMainContentProvider* provider) {
-    T1ProfileContentMainEntry* mediaEntry =
-        objc_getAssociatedObject(provider, ProfileMediaEntryKey);
     Class entryClass = objc_getClass("T1ProfileContentMainEntry");
-    if (!entryClass || ![entryClass instancesRespondToSelector:@selector(setTitle:)] ||
+    if (!entryClass ||
+        ![entryClass instancesRespondToSelector:@selector(setTitle:)] ||
         ![entryClass instancesRespondToSelector:@selector(setViewControllerCreateBlock:)]) {
+        return nil;
+    }
+
+    id photoEntry = ProfileMediaObjectValue(provider, @selector(photoEntry));
+    id videoEntry = ProfileMediaObjectValue(provider, @selector(videoEntry));
+    id mediaEntry = [photoEntry isKindOfClass:entryClass] ? photoEntry :
+                    ([videoEntry isKindOfClass:entryClass] ? videoEntry : nil);
+    if (!mediaEntry) {
         return nil;
     }
 
@@ -59,15 +67,6 @@ static T1ProfileContentMainEntry* ProfileMediaEntryForProvider(
     if (!postsEntry || !originalFactory ||
         ![postsEntry respondsToSelector:@selector(viewControllerCreateBlock)]) {
         return nil;
-    }
-
-    if (!mediaEntry) {
-        mediaEntry = [[entryClass alloc] init];
-        if (!mediaEntry) {
-            return nil;
-        }
-        objc_setAssociatedObject(provider, ProfileMediaEntryKey, mediaEntry,
-                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
 
     id (^postsFactory)(void) = originalFactory;
