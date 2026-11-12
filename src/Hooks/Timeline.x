@@ -919,7 +919,17 @@ void BHTimelineScheduleProfileMediaScan(id object) {
 
     CFTimeInterval lastScan =
         [objc_getAssociatedObject(viewController, ProfileMediaLastScanKey) doubleValue];
-    if (CFAbsoluteTimeGetCurrent() - lastScan < 1.2) {
+    CFTimeInterval elapsedSinceScan = CFAbsoluteTimeGetCurrent() - lastScan;
+    if (elapsedSinceScan < 1.2) {
+        objc_setAssociatedObject(viewController, ProfileMediaScanPendingKey, @YES,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                      (int64_t)((1.2 - elapsedSinceScan) * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            objc_setAssociatedObject(viewController, ProfileMediaScanPendingKey, nil,
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            BHTimelineScheduleProfileMediaScan(viewController);
+        });
         return;
     }
 
