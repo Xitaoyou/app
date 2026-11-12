@@ -41,9 +41,7 @@ static BOOL ProfileMediaEntryIsSplitMedia(id entry, id photoEntry, id videoEntry
            [title isEqualToString:@"media"];
 }
 
-// Reuse one of the provider's initialized native entries. A freshly allocated
-// T1ProfileContentMainEntry lacks private state that the profile controller
-// expects when it builds and selects the tabs.
+// Reuse an entry initialized by the native provider.
 static T1ProfileContentMainEntry* ProfileMediaEntryForProvider(
     T1ProfileDisplayNormalMainContentProvider* provider) {
     Class entryClass = objc_getClass("T1ProfileContentMainEntry");
@@ -86,10 +84,18 @@ static T1ProfileContentMainEntry* ProfileMediaEntryForProvider(
     return mediaEntry;
 }
 
+// contentMainEntries is an array of entry groups. The profile controller
+// indexes the outer array, then sends -indexOfObject: to the selected group.
+// Keep that two-level shape while replacing the split media entries.
 static NSArray* ProfileMediaMergedMainEntries(
     T1ProfileDisplayNormalMainContentProvider* provider, id originalEntries) {
     if (![originalEntries isKindOfClass:[NSArray class]]) {
         return originalEntries;
+    }
+    for (id group in originalEntries) {
+        if (![group isKindOfClass:[NSArray class]]) {
+            return originalEntries;
+        }
     }
 
     T1ProfileContentMainEntry* mediaEntry = ProfileMediaEntryForProvider(provider);
@@ -99,36 +105,42 @@ static NSArray* ProfileMediaMergedMainEntries(
 
     id photoEntry = ProfileMediaObjectValue(provider, @selector(photoEntry));
     id videoEntry = ProfileMediaObjectValue(provider, @selector(videoEntry));
-    NSMutableArray* result = [NSMutableArray arrayWithCapacity:[originalEntries count]];
-    NSUInteger insertionIndex = NSNotFound;
-    NSUInteger fallbackIndex = 0;
-    NSArray<NSString*>* anchorSelectors =
-        @[@"allPostsEntry", @"tweetsOnlyEntry", @"tweetsAndRepliesEntry"];
+    id postsEntry = ProfileMediaObjectValue(provider, @selector(allPostsEntry));
+    NSMutableArray* groups = [NSMutableArray arrayWithCapacity:[originalEntries count]];
+    BOOL insertedMedia = NO;
+    NSUInteger fallbackOuterIndex = NSNotFound;
 
-    for (NSUInteger index = 0; index < [originalEntries count]; index++) {
-        id entry = originalEntries[index];
-        if (ProfileMediaEntryIsSplitMedia(entry, photoEntry, videoEntry)) {
-            if (insertionIndex == NSNotFound) {
-                insertionIndex = result.count;
+    for (NSArray* group in originalEntries) {
+        NSMutableArray* filteredGroup = [NSMutableArray arrayWithCapacity:[group count]];
+        BOOL containsPosts = NO;
+        for (id entry in group) {
+            if (entry == postsEntry) {
+                containsPosts = YES;
             }
-            continue;
+            if (ProfileMediaEntryIsSplitMedia(entry, photoEntry, videoEntry)) {
+                if (!insertedMedia) {
+                    [filteredGroup addObject:mediaEntry];
+                    insertedMedia = YES;
+                }
+                continue;
+            }
+            [filteredGroup addObject:entry];
         }
-
-        [result addObject:entry];
-        for (NSString* selectorName in anchorSelectors) {
-            id anchor = ProfileMediaObjectValue(provider, NSSelectorFromString(selectorName));
-            if (anchor && entry == anchor) {
-                fallbackIndex = result.count;
+        if ([filteredGroup count] > 0) {
+            [groups addObject:[filteredGroup copy]];
+            if (containsPosts) {
+                fallbackOuterIndex = [groups count];
             }
         }
     }
 
-    if (insertionIndex == NSNotFound) {
-        insertionIndex = fallbackIndex;
+    if (!insertedMedia) {
+        // Profiles without native media entries still get their own Media tab.
+        NSUInteger index = fallbackOuterIndex == NSNotFound
+                              ? [groups count] : fallbackOuterIndex;
+        [groups insertObject:@[mediaEntry] atIndex:index];
     }
-    insertionIndex = MIN(insertionIndex, result.count);
-    [result insertObject:mediaEntry atIndex:insertionIndex];
-    return [result copy];
+    return [groups copy];
 }
 
 %hook T1ProfileDisplayNormalMainContentProvider
