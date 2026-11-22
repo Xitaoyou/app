@@ -685,6 +685,7 @@ static char ArchiveScannerKey;
 @property (nonatomic, strong) NSMutableArray *states;
 @property (nonatomic, strong) NSMapTable *raw;
 @property (nonatomic, strong) NSHashTable *initialized;
+@property (nonatomic, strong) NSMutableSet<NSString *> *processedPosts;
 @property (nonatomic, strong) UILabel *label;
 @property (nonatomic, strong) NSTimer *timer;
 @property (nonatomic, copy) NSArray *lastSignature;
@@ -776,6 +777,7 @@ void NFBArchiveCaptureSections(id controller, NSArray *sections) {
     self.view.backgroundColor = UIColor.systemBackgroundColor;
     self.raw = [NSMapTable weakToStrongObjectsMapTable];
     self.initialized = [NSHashTable weakObjectsHashTable];
+    self.processedPosts = [NSMutableSet set];
     self.states = [@[@"等待", @"等待"] mutableCopy];
     self.label = [[UILabel alloc] init];
     self.label.numberOfLines = 0;
@@ -953,6 +955,7 @@ void NFBArchiveCaptureSections(id controller, NSArray *sections) {
                 continue;
             }
             [signature addObject:postID];
+            if ([self.processedPosts containsObject:postID]) continue;
             if ([IntegerValue(model, @"isRetweet") boolValue]) continue;
             NSString *authorID = [IntegerValue(model, @"fromUserID") stringValue];
             if (authorID.length && ![authorID isEqualToString:self.batch[@"author"]]) continue;
@@ -968,6 +971,7 @@ void NFBArchiveCaptureSections(id controller, NSArray *sections) {
             }
             NSMutableDictionary *job = ArchiveJob(queue, snapshot, self.batch[@"account"]);
             changed |= RefreshMissingMedia(queue, job, snapshot[@"files"]);
+            [self.processedPosts addObject:postID];
             if ([known containsObject:postID]) continue;
             [known addObject:postID];
             [unreadable removeObject:postID];
