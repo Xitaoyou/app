@@ -4,6 +4,7 @@
 #import "Headers/TFNHeaders.h"
 #import <objc/message.h>
 #import <objc/runtime.h>
+#include <string.h>
 #import "Hooks/HookHelpers.h"
 
 static NSString * const Changed = @"NFBDriveArchiveChanged";
@@ -58,7 +59,8 @@ static NSURL *MediaURL(NSString *string) {
 static NSArray *MediaFiles(id status) {
     id entities = ObjectValue(status, @"entities");
     NSArray *media = ObjectValue(entities, @"media");
-    if (!entities || (media && ![media isKindOfClass:NSArray.class])) return nil;
+    if (!entities || ![entities respondsToSelector:@selector(media)] ||
+        (media && ![media isKindOfClass:NSArray.class])) return nil;
     NSMutableArray *files = [NSMutableArray array];
     for (TFSTwitterEntityMedia *item in media) {
         if (![item isKindOfClass:objc_getClass("TFSTwitterEntityMedia")]) {
@@ -86,7 +88,13 @@ static NSArray *MediaFiles(id status) {
             NSURL *primary = MediaURL(item.videoInfo.primaryUrl);
             if ([primary.pathExtension.lowercaseString isEqualToString:@"m3u8"]) playlist = primary;
         }
+        NSString *identity = StringValue(item, @[@"mediaKey"]);
+        if (!identity.length) {
+            NSNumber *mediaID = IntegerValue(item, @"mediaID");
+            if (mediaID.unsignedLongLongValue > 0) identity = mediaID.stringValue;
+        }
         [files addObject:[@{@"source": (url ?: playlist).absoluteString ?: @"", @"type": @(type),
+                            @"mediaID": identity ?: @"",
                             @"playlist": @(!url && playlist != nil)} mutableCopy]];
     }
     return files;
@@ -139,6 +147,30 @@ static NSURL *API(NSString *path, NSDictionary *query) {
     for (NSString *key in query) [items addObject:[NSURLQueryItem queryItemWithName:key value:query[key]]];
     parts.queryItems = items.count ? items : nil;
     return parts.URL;
+}
+
+static NSDictionary *MediaExtensions(void) {
+    return @{@"image/jpeg": @"jpg", @"image/png": @"png", @"image/webp": @"webp",
+             @"image/gif": @"gif", @"image/avif": @"avif", @"video/mp4": @"mp4"};
+}
+
+// A .data file is only installed after a completed download or FFmpeg export.
+// Read its signature to recover downloads installed before queue.json was updated.
+static NSString *DownloadedMediaType(NSURL *url) {
+    NSFileHandle *handle = [NSFileHandle fileHandleForReadingFromURL:url error:nil];
+    NSData *header = [handle readDataUpToLength:32 error:nil];
+    [handle closeFile];
+    const unsigned char *bytes = header.bytes;
+    NSUInteger count = header.length;
+    if (count >= 3 && bytes[0] == 0xff && bytes[1] == 0xd8 && bytes[2] == 0xff) return @"image/jpeg";
+    if (count >= 8 && memcmp(bytes, "\x89PNG\r\n\x1a\n", 8) == 0) return @"image/png";
+    if (count >= 6 && (!memcmp(bytes, "GIF87a", 6) || !memcmp(bytes, "GIF89a", 6))) return @"image/gif";
+    if (count >= 12 && !memcmp(bytes, "RIFF", 4) && !memcmp(bytes + 8, "WEBP", 4)) return @"image/webp";
+    if (count >= 12 && !memcmp(bytes + 4, "ftyp", 4)) {
+        if (!memcmp(bytes + 8, "avif", 4) || !memcmp(bytes + 8, "avis", 4)) return @"image/avif";
+        return @"video/mp4";
+    }
+    return nil;
 }
 
 typedef void (^DriveReply)(NSDictionary *, NSHTTPURLResponse *, NSError *);
@@ -413,8 +445,20 @@ typedef void (^DriveReply)(NSDictionary *, NSHTTPURLResponse *, NSError *);
 }
 
 - (NSURL *)localFile:(NSUInteger)index {
-    NSString *name = [NSString stringWithFormat:@"%@-%lu.data", self.active[@"id"], (unsigned long)index];
+    return [self localFileForJob:self.active index:index];
+}
+
+- (NSURL *)localFileForJob:(NSDictionary *)job index:(NSUInteger)index {
+    NSString *name = [NSString stringWithFormat:@"%@-%lu.data", job[@"id"], (unsigned long)index];
     return [self.directory URLByAppendingPathComponent:name];
+}
+
+- (BOOL)saveMediaMetadata:(NSMutableDictionary *)file mime:(NSString *)mime index:(NSUInteger)index {
+    file[@"mime"] = mime;
+    file[@"name"] = [NSString stringWithFormat:@"%@ - %02lu.%@", self.active[@"prefix"],
+                     (unsigned long)index, MediaExtensions()[mime]];
+    [file removeObjectForKey:@"downloadResume"];
+    return [self save];
 }
 
 - (void)recordFailure:(NSMutableDictionary *)file message:(NSString *)message {
@@ -447,6 +491,17 @@ typedef void (^DriveReply)(NSDictionary *, NSHTTPURLResponse *, NSError *);
         [self upload:file key:key index:index offset:nil];
         return;
     }
+    if ([NSFileManager.defaultManager fileExistsAtPath:local.path]) {
+        NSString *mime = DownloadedMediaType(local);
+        if (mime) {
+            if (![self saveMediaMetadata:file mime:mime index:index]) {
+                [self stop:@"failed" message:@"无法恢复下载记录"]; return;
+            }
+            [self upload:file key:key index:index offset:nil];
+            return;
+        }
+        // Preserve an unreadable file until a complete replacement is available.
+    }
 
     NSURL *source = MediaURL(file[@"source"]);
     if (!source) { [self recordFailure:file message:@"此附件没有可保存的媒体文件地址"]; return; }
@@ -466,16 +521,16 @@ typedef void (^DriveReply)(NSDictionary *, NSHTTPURLResponse *, NSError *);
                 }
                 self.mediaSession = nil;
                 BOOL ok = [ReturnCode isSuccess:[session getReturnCode]] &&
-                    [NSFileManager.defaultManager moveItemAtURL:temporary toURL:local error:nil];
+                    [self installDownload:temporary to:local];
                 if (!ok) {
                     [NSFileManager.defaultManager removeItemAtURL:temporary error:nil];
                     [self retry:@"串流视频保存失败，请重试" operation:^{ [self prepare:file key:key index:index]; }];
                     return;
                 }
                 self.retries = 0;
-                file[@"mime"] = @"video/mp4";
-                file[@"name"] = [NSString stringWithFormat:@"%@ - %02lu.mp4", self.active[@"prefix"], (unsigned long)index];
-                if (![self save]) { [self stop:@"failed" message:@"无法保存下载进度"]; return; }
+                if (![self saveMediaMetadata:file mime:@"video/mp4" index:index]) {
+                    [self stop:@"failed" message:@"无法保存下载进度"]; return;
+                }
                 [self upload:file key:key index:index offset:nil];
             });
         }];
@@ -486,9 +541,7 @@ typedef void (^DriveReply)(NSDictionary *, NSHTTPURLResponse *, NSError *);
         // The download location expires when this callback returns.
         NSHTTPURLResponse *http = (NSHTTPURLResponse *)response;
         NSString *mime = response.MIMEType.lowercaseString;
-        NSDictionary *extensions = @{@"image/jpeg": @"jpg", @"image/png": @"png", @"image/webp": @"webp",
-                                      @"image/gif": @"gif", @"image/avif": @"avif", @"video/mp4": @"mp4"};
-        NSString *extension = extensions[mime ?: @""];
+        NSString *extension = MediaExtensions()[mime ?: @""];
         NSURL *temporary = nil;
         if (!error && location && extension && http.statusCode >= 200 && http.statusCode < 300 && MediaURL(response.URL.absoluteString)) {
             temporary = [local URLByAppendingPathExtension:NSUUID.UUID.UUIDString];
@@ -502,14 +555,14 @@ typedef void (^DriveReply)(NSDictionary *, NSHTTPURLResponse *, NSError *);
             self.network = nil;
             [file removeObjectForKey:@"downloadResume"];
             if (temporary) {
-                if (![NSFileManager.defaultManager moveItemAtURL:temporary toURL:local error:nil]) {
+                if (![self installDownload:temporary to:local]) {
                     [NSFileManager.defaultManager removeItemAtURL:temporary error:nil];
                     [self recordFailure:file message:@"无法保存下载的文件"]; return;
                 }
                 self.retries = 0;
-                file[@"mime"] = mime;
-                file[@"name"] = [NSString stringWithFormat:@"%@ - %02lu.%@", self.active[@"prefix"], (unsigned long)index, extension];
-                if (![self save]) { [self stop:@"failed" message:@"无法保存下载进度"]; return; }
+                if (![self saveMediaMetadata:file mime:mime index:index]) {
+                    [self stop:@"failed" message:@"无法保存下载进度"]; return;
+                }
                 [self upload:file key:key index:index offset:nil];
             } else if (error || http.statusCode == 429 || http.statusCode >= 500) {
                 NSData *checkpoint = error.userInfo[NSURLSessionDownloadTaskResumeData];
@@ -523,6 +576,16 @@ typedef void (^DriveReply)(NSDictionary *, NSHTTPURLResponse *, NSError *);
     if (resume.length) self.network = [self.session downloadTaskWithResumeData:resume completionHandler:done];
     else self.network = [self.session downloadTaskWithURL:source completionHandler:done];
     [self.network resume];
+}
+
+- (BOOL)installDownload:(NSURL *)temporary to:(NSURL *)local {
+    NSFileManager *manager = NSFileManager.defaultManager;
+    if ([manager fileExistsAtPath:local.path]) {
+        return [manager replaceItemAtURL:local withItemAtURL:temporary backupItemName:nil
+                                  options:NSFileManagerItemReplacementUsingNewMetadataOnly
+                         resultingItemURL:nil error:nil];
+    }
+    return [manager moveItemAtURL:temporary toURL:local error:nil];
 }
 
 - (void)upload:(NSMutableDictionary *)file key:(NSString *)key index:(NSUInteger)index offset:(NSNumber *)offset {
@@ -631,6 +694,48 @@ static char ArchiveScannerKey;
 @property (nonatomic) BOOL paused;
 @end
 
+static NSDictionary *MatchingMedia(NSDictionary *old, NSArray *freshFiles, NSArray *oldFiles) {
+    NSString *identity = old[@"mediaID"];
+    NSURL *oldURL = MediaURL(old[@"source"]);
+    NSDictionary *onlyCandidate = nil;
+    NSUInteger candidates = 0, oldCandidates = 0;
+    for (NSDictionary *item in freshFiles) {
+        NSURL *newURL = MediaURL(item[@"source"]);
+        if (!newURL || ![old[@"type"] isEqual:item[@"type"]]) continue;
+        if (identity.length && [identity isEqualToString:item[@"mediaID"]]) return item;
+        if ((!identity.length || ![item[@"mediaID"] length]) && oldURL &&
+            [oldURL.host isEqualToString:newURL.host] && [oldURL.path isEqualToString:newURL.path]) return item;
+        onlyCandidate = item;
+        candidates++;
+    }
+    if (identity.length || oldURL || candidates != 1 || freshFiles.count != oldFiles.count) return nil;
+    for (NSDictionary *item in oldFiles) if ([old[@"type"] isEqual:item[@"type"]]) oldCandidates++;
+    return oldCandidates == 1 ? onlyCandidate : nil;
+}
+
+static BOOL RefreshMissingMedia(NFBArchiveQueue *queue, NSMutableDictionary *job, NSArray *freshFiles) {
+    if (job == queue.active || [job[@"state"] isEqualToString:@"complete"]) return NO;
+    BOOL refreshed = NO;
+    NSArray *oldFiles = job[@"files"];
+    for (NSUInteger index = 1; index < oldFiles.count; index++) {
+        NSMutableDictionary *file = oldFiles[index];
+        if ([file[@"done"] boolValue]) continue;
+        NSURL *local = [queue localFileForJob:job index:index];
+        if ([NSFileManager.defaultManager fileExistsAtPath:local.path] &&
+            ([file[@"mime"] length] || DownloadedMediaType(local))) continue;
+        NSDictionary *fresh = MatchingMedia(file, freshFiles, oldFiles);
+        if (!fresh || [fresh[@"source"] isEqualToString:file[@"source"]]) continue;
+        file[@"source"] = fresh[@"source"];
+        file[@"playlist"] = fresh[@"playlist"] ?: @NO;
+        file[@"mediaID"] = fresh[@"mediaID"] ?: @"";
+        [file removeObjectForKey:@"downloadResume"];
+        [file removeObjectForKey:@"session"];
+        [file removeObjectForKey:@"error"];
+        refreshed = YES;
+    }
+    return refreshed;
+}
+
 static NSMutableDictionary *ArchiveJob(NFBArchiveQueue *queue, NSDictionary *snapshot, NSString *account) {
     for (NSMutableDictionary *job in queue.jobs) {
         if ([job[@"account"] isEqualToString:account] && [job[@"post"] isEqualToString:snapshot[@"post"]]) return job;
@@ -640,6 +745,14 @@ static NSMutableDictionary *ArchiveJob(NFBArchiveQueue *queue, NSDictionary *sna
                                     @"state": @"waiting", @"message": @"等待上传"}];
     [queue.jobs insertObject:job atIndex:0];
     return job;
+}
+
+static BOOL IsArchiveTimelineDecoration(id model) {
+    NSString *name = NSStringFromClass(object_getClass(model));
+    return [@[@"_TtC10TwitterURT24URTModuleHeaderViewModel",
+              @"_TtC10TwitterURT24URTModuleFooterViewModel",
+              @"_TtC10TwitterURT33URTModuleSeparatorFooterViewModel",
+              @"URTTimelineMessageItemViewModel"] containsObject:name ?: @""];
 }
 
 static void DisplayScanner(UIViewController *presenter, NFBArchiveScanner *scanner) {
@@ -796,42 +909,66 @@ void NFBArchiveCaptureSections(id controller, NSArray *sections) {
     }
     UIViewController *source = self.sources[self.sourceIndex];
     NSArray *sections = [self.raw objectForKey:source];
+    BOOL initialized = [self.initialized containsObject:source];
     NSMutableArray *signature = [NSMutableArray array];
     NSMutableSet *known = [NSMutableSet setWithArray:self.batch[@"posts"]];
     NSMutableSet *unreadable = [NSMutableSet setWithArray:self.batch[@"unreadable"]];
     BOOL changed = NO, error = NO;
     Class statusClass = objc_getClass("URTTimelineStatusItemViewModel");
+    Class statusAdapterClass = objc_getClass("T1TwitterCoreStatusViewModelAdapter");
     Class errorClass = objc_getClass("URTTimelineCursorErrorViewModel");
     Class cursorClass = objc_getClass("URTTimelineCursorViewModel");
     NFBArchiveQueue *queue = NFBArchiveQueue.shared;
+    NSUInteger position = 0;
     for (NSArray *section in sections) {
-        if (![section isKindOfClass:NSArray.class]) continue;
+        if (![section isKindOfClass:NSArray.class]) {
+            if (initialized) {
+                NSString *key = [NSString stringWithFormat:@"row:%lu:section:%lu", (unsigned long)self.sourceIndex, (unsigned long)position++];
+                if (![unreadable containsObject:key]) { [unreadable addObject:key]; changed = YES; }
+            }
+            continue;
+        }
         for (id row in section) {
+            position++;
             id model = unwrapDataViewItem(row);
             if (errorClass && [model isKindOfClass:errorClass]) { error = YES; continue; }
             if (cursorClass && [model isKindOfClass:cursorClass]) {
                 [signature addObject:[model description]];
                 continue;
             }
-            if (!statusClass || ![model isKindOfClass:statusClass]) continue;
-            NSString *postID = [IntegerValue(model, @"statusID") stringValue];
-            if (!postID.length) continue;
+            NSNumber *identifier = IntegerValue(model, @"statusID");
+            NSString *postID = identifier.longLongValue > 0 ? identifier.stringValue : nil;
+            BOOL status = (statusClass && [model isKindOfClass:statusClass]) ||
+                          (statusAdapterClass && [model isKindOfClass:statusAdapterClass]);
+            if (!status || !postID.length) {
+                if (!initialized || IsArchiveTimelineDecoration(model)) continue;
+                NSString *entry = StringValue(model, @[@"entryID"]);
+                NSString *key = postID.length ? postID : [NSString stringWithFormat:@"row:%lu:%@:%@",
+                    (unsigned long)self.sourceIndex, NSStringFromClass(object_getClass(model)) ?: @"unknown",
+                    entry.length ? entry : [@(position) stringValue]];
+                if (![known containsObject:key] && ![unreadable containsObject:key]) {
+                    [unreadable addObject:key];
+                    changed = YES;
+                }
+                continue;
+            }
             [signature addObject:postID];
-            if ([known containsObject:postID]) continue;
             if ([IntegerValue(model, @"isRetweet") boolValue]) continue;
             NSString *authorID = [IntegerValue(model, @"fromUserID") stringValue];
             if (authorID.length && ![authorID isEqualToString:self.batch[@"author"]]) continue;
             NSArray *assets = MediaFiles(model);
-            if (assets && !assets.count) continue;
             NSDictionary *snapshot = Snapshot(model);
-            if (![snapshot[@"author"] isEqualToString:self.batch[@"author"]]) {
+            if (![snapshot[@"author"] isEqualToString:self.batch[@"author"]] || !assets.count) {
+                if ([known containsObject:postID]) continue;
                 if (![unreadable containsObject:postID]) {
                     [unreadable addObject:postID];
                     changed = YES;
                 }
                 continue;
             }
-            ArchiveJob(queue, snapshot, self.batch[@"account"]);
+            NSMutableDictionary *job = ArchiveJob(queue, snapshot, self.batch[@"account"]);
+            changed |= RefreshMissingMedia(queue, job, snapshot[@"files"]);
+            if ([known containsObject:postID]) continue;
             [known addObject:postID];
             [unreadable removeObject:postID];
             changed = YES;
@@ -857,7 +994,7 @@ void NFBArchiveCaptureSections(id controller, NSArray *sections) {
         [self stop:@"incomplete" message:@"当前媒体列表不支持原生分页检查"]; return;
     }
     if (error) { [self stop:@"incomplete" message:@"X 返回了分页错误，请从该主页重试"]; return; }
-    if ([self.initialized containsObject:source] &&
+    if (initialized && sections &&
         ((BOOL (*)(id, SEL))objc_msgSend)(source, tail)) {
         self.states[self.sourceIndex] = @"已到尾";
         self.batch[@"sources"] = [self.states copy];
@@ -868,7 +1005,7 @@ void NFBArchiveCaptureSections(id controller, NSArray *sections) {
             [self mountSource];
         } else {
             [self stop:unreadable.count ? @"incomplete" : @"scanned"
-                message:unreadable.count ? [NSString stringWithFormat:@"%lu 条帖子无法读取，已保存可用项目", (unsigned long)unreadable.count] :
+                message:unreadable.count ? [NSString stringWithFormat:@"%lu 个媒体条目无法确认，已保留可用项目", (unsigned long)unreadable.count] :
                     @"两路扫描完成。上传结果可在任务中心查看。"];
         }
         return;
@@ -927,6 +1064,10 @@ void NFBArchiveProfile(UIViewController *presenter, id author,
         batch[@"handle"] = handle;
         batch[@"name"] = StringValue(author, @[@"displayFullName", @"fullName", @"name"]) ?: handle;
         batch[@"state"] = @"scanning";
+        // Unknown rows without post IDs are specific to the previous scan.
+        NSMutableArray *remaining = [NSMutableArray array];
+        for (NSString *key in batch[@"unreadable"]) if (![key hasPrefix:@"row:"]) [remaining addObject:key];
+        batch[@"unreadable"] = remaining;
         batch[@"message"] = @"扫描中";
         batch[@"sources"] = @[@"等待", @"等待"];
         if (![queue save]) { Message(presenter, @"无法归档", @"无法保存任务，请检查本机空间。"); return; }
@@ -1064,8 +1205,16 @@ void NFBArchiveProfile(UIViewController *presenter, id author,
     NFBArchiveQueue *queue = NFBArchiveQueue.shared;
     NSArray *jobs = [self jobsForBatch:batch];
     NSString *title = [NSString stringWithFormat:@"@%@ 的主页归档", batch[@"handle"]];
+    NSString *message = [self batchDetails:batch];
+    NSArray *unreadable = batch[@"unreadable"];
+    if (unreadable.count) {
+        NSArray *sample = [unreadable subarrayWithRange:NSMakeRange(0, MIN((NSUInteger)5, unreadable.count))];
+        message = [message stringByAppendingFormat:@"\n\n未确认条目（%lu）：\n%@%@",
+                   (unsigned long)unreadable.count, [sample componentsJoinedByString:@"\n"],
+                   unreadable.count > sample.count ? @"\n…（其余未显示）" : @""];
+    }
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:title
-        message:[self batchDetails:batch] preferredStyle:UIAlertControllerStyleAlert];
+        message:message preferredStyle:UIAlertControllerStyleAlert];
     BOOL pending = NO, retryable = NO;
     NSString *folder = nil;
     for (NSDictionary *job in jobs) {
@@ -1155,6 +1304,16 @@ void NFBArchivePost(UIViewController *presenter, id status) {
                 [queue.jobs removeObjectAtIndex:0];
                 Message(presenter, @"无法创建收藏任务", @"请检查本机可用空间。");
                 return;
+            }
+        } else if (existing != queue.active && ![existing[@"state"] isEqualToString:@"complete"]) {
+            BOOL refreshed = RefreshMissingMedia(queue, existing, snapshot[@"files"]);
+            if (refreshed && ![queue save]) {
+                Message(presenter, @"无法更新收藏任务", @"请检查本机可用空间。");
+                return;
+            }
+            if ([existing[@"state"] isEqualToString:@"failed"]) {
+                for (NSMutableDictionary *file in existing[@"files"]) [file removeObjectForKey:@"error"];
+                [queue resume:existing];
             }
         }
         [queue run];
