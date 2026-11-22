@@ -151,8 +151,14 @@ jobs:
           fi
           echo "version=${X_VERSION}" >> "$GITHUB_OUTPUT"
           echo "$X_VERSION"
+          if [ -n "$NFB_DRIVE_IOS_CLIENT_ID" ]; then
+            python3 main/tools/configure-drive-oauth.py
+            (cd main/tmp && zip -q ../packages/com.atebits.Tweetie2.ipa Payload/Twitter.app/Info.plist)
+          fi
         env:
           IPA_URL: ${{ secrets.NFB_DECRYPTED_IPA_URL }}
+          NFB_DRIVE_IOS_CLIENT_ID: ${{ vars.NFB_DRIVE_IOS_CLIENT_ID }}
+          NFB_DRIVE_IOS_BUNDLE_ID: ${{ vars.NFB_DRIVE_IOS_BUNDLE_ID }}
 
       - name: Prepare Image Pack
         if: inputs.resource_pack_url != '' && (inputs.deploy_format == 'sideloaded' || inputs.deploy_format == 'trollstore')

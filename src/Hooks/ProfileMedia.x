@@ -5,6 +5,7 @@
 //
 
 #import "HookHelpers.h"
+#import "Archive/NFBDriveArchive.h"
 #include <limits.h>
 
 static const void* NativeMediaPairKey = &NativeMediaPairKey;
@@ -191,6 +192,7 @@ static id NativeMediaWrappedItem(id item, UIViewController* source,
 // nil means this is not one of the two native Media sources. Native input
 // sections are retained separately from the visible merged presentation.
 NSArray* BHProfileMediaNativeSections(id controller, NSArray* sections) {
+    NFBArchiveCaptureSections(controller, sections);
     NFBProfileMediaPair* pair = objc_getAssociatedObject(controller, NativeMediaPairKey);
     if (!pair) return nil;
     if (pair.publishing || pair.displayDepth > 0) return sections ?: @[];
@@ -343,6 +345,40 @@ static NSArray* ProfileMediaMergedMainEntries(
 %hook T1ProfileDisplayNormalMainContentProvider
 - (id)contentMainEntries {
     return ProfileMediaMergedMainEntries(self, %orig);
+}
+%end
+
+%hook T1ProfileHeaderViewController
+- (NSArray*)profileMoreActionsBaseActionItemsWithSender:(id)sender {
+    NSArray* original = %orig;
+    UIViewController* profile = self;
+    Class profileClass = objc_getClass("T1ProfileViewController");
+    while (profile && ![profile isKindOfClass:profileClass]) profile = profile.parentViewController;
+    id provider = MediaValue(profile, @selector(currentDisplayContentProvider));
+    SEL photoFactory = @selector(_generatePhotoViewController);
+    SEL videoFactory = @selector(_generateVideoViewController);
+    if (![provider respondsToSelector:photoFactory] || ![provider respondsToSelector:videoFactory]) return original;
+    id author = MediaValue(MediaValue(MediaValue(profile, @selector(viewModel)), @selector(userDataSource)), @selector(user));
+    SEL privacy = @selector(protectedUser);
+    if (![author respondsToSelector:privacy] || ((BOOL (*)(id, SEL))objc_msgSend)(author, privacy)) return original;
+    __weak UIViewController* presenter = profile;
+    __weak id weakProvider = provider;
+    TFNActionItem* archive = [%c(TFNActionItem) actionItemWithTitle:@"归档全部媒体到 Google Drive"
+        imageName:@"bookmark_stroke" action:^{
+            dispatch_async(dispatch_get_main_queue(), ^{
+                UIViewController* controller = presenter;
+                id current = weakProvider;
+                if (!controller || !current ||
+                    MediaValue(controller, @selector(currentDisplayContentProvider)) != current) return;
+                NFBArchiveProfile(controller, author, ^UIViewController*{
+                    return MediaValue(current, photoFactory);
+                }, ^UIViewController*{
+                    return MediaValue(current, videoFactory);
+                });
+            });
+        }];
+    if (!archive) return original;
+    return [(original ?: @[]) arrayByAddingObject:archive];
 }
 %end
 

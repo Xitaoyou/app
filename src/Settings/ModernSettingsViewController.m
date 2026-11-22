@@ -6,6 +6,7 @@
 //
 
 #import "Settings/ModernSettingsViewController.h"
+#import "Archive/NFBDriveArchive.h"
 #import "Core/BHTBundle.h"
 #import "Core/BHTManager.h"
 #import "Settings/ModernSettingsCells.h"
@@ -215,6 +216,12 @@
                 [[BHTBundle sharedBundle] localizedStringForKey:@"MODERN_SETTINGS_MEDIA_SUBTITLE"],
             @"icon": @"media_tab_stroke",
             @"action": @"showDownloadsSettings"
+        },
+        @{
+            @"title": @"云收藏任务",
+            @"subtitle": @"查看进度、继续或重试 Google Drive 收藏",
+            @"icon": @"bookmark_stroke",
+            @"action": @"showArchiveTasks"
         },
         @{
             @"title": [[BHTBundle sharedBundle] localizedStringForKey:@"MODERN_SETTINGS_PROFILES_TITLE"],
@@ -678,6 +685,10 @@
 }
 
 #pragma mark - UITableViewDelegate
+
+- (void)showArchiveTasks {
+    [self.navigationController pushViewController:NFBArchiveTasks() animated:YES];
+}
 
 - (void)tableView:(UITableView*)tableView didSelectRowAtIndexPath:(NSIndexPath*)indexPath {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
