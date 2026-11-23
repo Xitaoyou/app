@@ -12,6 +12,15 @@
       "versions": [
         {
           "version": "12.42.1",
+          "buildVersion": "2",
+          "date": "2026-11-23T18:51:29Z",
+          "downloadURL": "https://github.com/Xitaoyou/app/releases/download/sidestore-x-12.42.1-r2/NeoFreeBird-Twitter-sideloaded_7.3.1_12.42.1_build2.ipa",
+          "size": 281683293,
+          "minOSVersion": "15.0",
+          "localizedDescription": "云收藏按博主浏览，支持帖子详情和 Drive 媒体缩略图。新文件名包含发帖时间、正文和作者，能完整写入文件名的媒体帖省去 TXT。"
+        },
+        {
+          "version": "12.42.1",
           "date": "2026-11-22T18:06:35Z",
           "downloadURL": "https://github.com/Xitaoyou/app/releases/download/sidestore-x-12.42.1-r1/NeoFreeBird-Twitter-sideloaded_7.3.1_12.42.1.ipa",
           "size": 281661355,
