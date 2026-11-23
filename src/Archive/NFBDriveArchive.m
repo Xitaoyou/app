@@ -197,6 +197,12 @@ static NSString *DriveFileQuery(NSString *key, NSString *parent) {
     return [NSString stringWithFormat:@"trashed = false and '%@' in parents and appProperties has { key='nfbArchiveKey' and value='%@' }", parent, key];
 }
 
+static BOOL ValidDriveID(NSString *identifier) {
+    if (![identifier isKindOfClass:NSString.class] || !identifier.length) return NO;
+    NSCharacterSet *invalid = [[NSCharacterSet characterSetWithCharactersInString:@"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"] invertedSet];
+    return [identifier rangeOfCharacterFromSet:invalid].location == NSNotFound;
+}
+
 static NSURL *API(NSString *path, NSDictionary *query) {
     NSURLComponents *parts = [NSURLComponents componentsWithString:[@"https://www.googleapis.com" stringByAppendingString:path]];
     NSMutableArray *items = [NSMutableArray array];
@@ -237,6 +243,7 @@ typedef void (^DriveReply)(NSDictionary *, NSHTTPURLResponse *, NSError *);
 @property (nonatomic, strong) NSURL *directory;
 @property (nonatomic, strong) NSURLSession *session;
 @property (nonatomic, strong) NSMutableDictionary *active;
+@property (nonatomic, strong) NSMutableDictionary *removing;
 @property (nonatomic, strong) NSURLSessionTask *network;
 @property (nonatomic, strong) FFmpegSession *mediaSession;
 @property (nonatomic) NSUInteger generation;
@@ -248,6 +255,9 @@ typedef void (^DriveReply)(NSDictionary *, NSHTTPURLResponse *, NSError *);
 - (void)run;
 - (void)pause:(NSMutableDictionary *)job;
 - (void)resume:(NSMutableDictionary *)job;
+- (NSString *)removalBlocker:(NSMutableDictionary *)job;
+- (BOOL)removeRecord:(NSMutableDictionary *)job;
+- (void)trashArchive:(NSMutableDictionary *)job completion:(void (^)(NSString *error))completion;
 @end
 
 @implementation NFBArchiveQueue
@@ -344,16 +354,201 @@ typedef void (^DriveReply)(NSDictionary *, NSHTTPURLResponse *, NSError *);
 }
 
 - (void)resume:(NSMutableDictionary *)job {
-    if (job == self.active || [job[@"state"] isEqualToString:@"complete"]) return;
+    if (job == self.active || [job[@"state"] isEqualToString:@"complete"] || [job[@"driveRemovalPending"] boolValue]) return;
     job[@"state"] = @"waiting";
     job[@"message"] = @"等待上传";
     if ([self save]) [self run];
 }
 
+- (NSString *)removalBlocker:(NSMutableDictionary *)job {
+    if (![self.jobs containsObject:job]) return @"这条收藏记录已删除。";
+    if (self.removing) return @"请等待当前的 Drive 删除操作完成。";
+    if (job == self.active || [job[@"state"] isEqualToString:@"running"] || [job[@"state"] isEqualToString:@"waiting"]) {
+        return @"请先在「任务」里暂停这条收藏，再删除。";
+    }
+    for (NSDictionary *batch in self.batches) {
+        if ([batch[@"state"] isEqualToString:@"scanning"] &&
+            [batch[@"account"] isEqual:job[@"account"]] && [batch[@"author"] isEqual:job[@"author"]]) {
+            return @"请先结束该博主正在进行的归档扫描。";
+        }
+    }
+    return nil;
+}
+
+- (BOOL)removeRecord:(NSMutableDictionary *)job {
+    NSUInteger index = [self.jobs indexOfObjectIdenticalTo:job];
+    if (index == NSNotFound) return YES;
+    NSMutableDictionary *affectedBatch = nil;
+    for (NSMutableDictionary *batch in self.batches) {
+        if ([batch[@"account"] isEqual:job[@"account"]] && [batch[@"author"] isEqual:job[@"author"]]) {
+            affectedBatch = batch;
+            break;
+        }
+    }
+    NSArray *oldPosts = affectedBatch[@"posts"];
+    NSArray *oldUnreadable = affectedBatch[@"unreadable"];
+    if (affectedBatch) {
+        NSMutableArray *posts = [oldPosts mutableCopy];
+        NSMutableArray *unreadable = [oldUnreadable mutableCopy];
+        [posts removeObject:job[@"post"]];
+        [unreadable removeObject:job[@"post"]];
+        affectedBatch[@"posts"] = posts;
+        affectedBatch[@"unreadable"] = unreadable;
+    }
+    [self.jobs removeObjectAtIndex:index];
+    if (![self save]) {
+        [self.jobs insertObject:job atIndex:index];
+        affectedBatch[@"posts"] = oldPosts;
+        affectedBatch[@"unreadable"] = oldUnreadable;
+        [NSNotificationCenter.defaultCenter postNotificationName:Changed object:nil];
+        return NO;
+    }
+    for (NSUInteger file = 0; file < [job[@"files"] count]; file++) {
+        [NSFileManager.defaultManager removeItemAtURL:[self localFileForJob:job index:file] error:nil];
+    }
+    return YES;
+}
+
+- (void)trashRequest:(NSMutableURLRequest *)request account:(NSString *)account retry:(BOOL)retry
+          completion:(void (^)(NSDictionary *, NSString *))completion {
+    if (![NFBDriveAuth.shared.account isEqualToString:account]) { completion(nil, @"请连接收藏时使用的 Google 账号。"); return; }
+    [NFBDriveAuth.shared token:^(NSString *token, NSString *error) {
+        if (!token.length || ![NFBDriveAuth.shared.account isEqualToString:account]) {
+            completion(nil, error ?: @"Google 账号已切换。");
+            return;
+        }
+        [request setValue:[@"Bearer " stringByAppendingString:token] forHTTPHeaderField:@"Authorization"];
+        [[self.session dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *networkError) {
+            NSInteger code = [(NSHTTPURLResponse *)response statusCode];
+            id decoded = data.length && code == 200 ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (![NFBDriveAuth.shared.account isEqualToString:account]) { completion(nil, @"Google 账号已切换。"); return; }
+                if (code == 401 && retry) {
+                    [NFBDriveAuth.shared invalidateAccessToken];
+                    [self trashRequest:request account:account retry:NO completion:completion];
+                } else if (code == 404 && [request.HTTPMethod isEqualToString:@"GET"] &&
+                           ![request.URL.path isEqualToString:@"/drive/v3/files"]) {
+                    completion(@{}, nil);
+                } else if ([decoded isKindOfClass:NSDictionary.class]) {
+                    completion(decoded, nil);
+                } else {
+                    completion(nil, code ? [NSString stringWithFormat:@"Drive 请求失败（%ld）。", (long)code] : @"无法连接 Google Drive。");
+                }
+            });
+        }] resume];
+    }];
+}
+
+- (void)collectTrashIDs:(NSMutableOrderedSet<NSString *> *)ids keys:(NSSet<NSString *> *)keys
+                 query:(NSString *)query page:(NSString *)page account:(NSString *)account
+            completion:(void (^)(NSString *error))completion {
+    NSMutableDictionary *params = [@{@"q": query, @"pageSize": @"100",
+        @"fields": @"nextPageToken,incompleteSearch,files(id,ownedByMe,appProperties)"} mutableCopy];
+    if (page.length) params[@"pageToken"] = page;
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:API(@"/drive/v3/files", params)];
+    [self trashRequest:request account:account retry:YES completion:^(NSDictionary *result, NSString *error) {
+        if (error || [result[@"incompleteSearch"] boolValue] || ![result[@"files"] isKindOfClass:NSArray.class]) {
+            completion(error ?: @"Drive 未返回完整的归档文件列表。");
+            return;
+        }
+        for (NSDictionary *item in result[@"files"]) {
+            NSString *fileID = item[@"id"];
+            if ([item[@"ownedByMe"] boolValue] && [keys containsObject:item[@"appProperties"][@"nfbArchiveKey"] ?: @""] &&
+                ValidDriveID(fileID)) [ids addObject:fileID];
+        }
+        NSString *next = result[@"nextPageToken"];
+        if (next.length && ![next isEqualToString:page]) {
+            [self collectTrashIDs:ids keys:keys query:query page:next account:account completion:completion];
+        } else {
+            completion(next.length ? @"Drive 文件列表分页未完成。" : nil);
+        }
+    }];
+}
+
+- (void)includeRecentUploads:(NSDictionary *)job index:(NSUInteger)index found:(NSMutableOrderedSet<NSString *> *)ids
+                  completion:(void (^)(NSString *error))completion {
+    NSArray *files = job[@"files"];
+    while (index < files.count) {
+        NSString *fileID = files[index][@"driveID"];
+        if (!ValidDriveID(fileID) || [ids containsObject:fileID]) { index++; continue; }
+        // Drive search can lag immediately after an upload. Confirm known IDs
+        // directly before reporting that all archived files are gone.
+        NSURL *url = API([@"/drive/v3/files/" stringByAppendingString:fileID],
+                        @{@"fields": @"id,ownedByMe,trashed,mimeType,appProperties"});
+        [self trashRequest:[NSMutableURLRequest requestWithURL:url] account:job[@"account"] retry:YES
+                completion:^(NSDictionary *result, NSString *error) {
+            if (error) { completion(error); return; }
+            if ([result[@"id"] isEqualToString:fileID] && [result[@"ownedByMe"] boolValue] &&
+                ![result[@"trashed"] boolValue] && ![result[@"mimeType"] isEqualToString:@"application/vnd.google-apps.folder"] &&
+                [result[@"appProperties"][@"nfbArchiveKey"] isEqualToString:DriveFileKey(job, index)]) [ids addObject:fileID];
+            [self includeRecentUploads:job index:index + 1 found:ids completion:completion];
+        }];
+        return;
+    }
+    completion(nil);
+}
+
+- (void)trashIDs:(NSArray<NSString *> *)ids index:(NSUInteger)index account:(NSString *)account
+      completion:(void (^)(NSString *error))completion {
+    if (index == ids.count) { completion(nil); return; }
+    NSString *fileID = ids[index];
+    NSURL *url = API([@"/drive/v3/files/" stringByAppendingString:fileID], @{@"fields": @"id,trashed"});
+    NSMutableURLRequest *request = [self JSONRequest:url method:@"PATCH" body:@{@"trashed": @YES}];
+    [self trashRequest:request account:account retry:YES completion:^(NSDictionary *result, NSString *error) {
+        if (error || ![result[@"id"] isEqualToString:fileID] || ![result[@"trashed"] boolValue]) {
+            completion([NSString stringWithFormat:@"已移到回收站 %lu/%lu 个文件。%@", (unsigned long)index,
+                        (unsigned long)ids.count, error ?: @"Drive 未确认其余文件。"]);
+            return;
+        }
+        [self trashIDs:ids index:index + 1 account:account completion:completion];
+    }];
+}
+
+- (void)trashArchive:(NSMutableDictionary *)job completion:(void (^)(NSString *error))completion {
+    NSString *blocked = [self removalBlocker:job];
+    if (blocked) { completion(blocked); return; }
+    NSString *account = job[@"account"];
+    if (![NFBDriveAuth.shared.account isEqualToString:account]) { completion(@"请连接收藏时使用的 Google 账号。"); return; }
+    self.removing = job;
+    BOOL wasPending = [job[@"driveRemovalPending"] boolValue];
+    job[@"driveRemovalPending"] = @YES;
+    if (![self save]) {
+        if (!wasPending) [job removeObjectForKey:@"driveRemovalPending"];
+        self.removing = nil;
+        completion(@"无法保存删除状态，本次未对 Drive 发出删除请求。");
+        return;
+    }
+    NSMutableSet *keys = [NSMutableSet set];
+    NSMutableArray *terms = [NSMutableArray array];
+    // Include slot zero (legacy TXT) plus the media slots from both file layouts.
+    NSUInteger lastSlot = MAX((NSUInteger)4, [job[@"files"] count]);
+    for (NSUInteger slot = 0; slot <= lastSlot; slot++) {
+        NSString *key = [NSString stringWithFormat:@"post-%@-%lu", job[@"post"], (unsigned long)slot];
+        [keys addObject:key];
+        [terms addObject:[NSString stringWithFormat:@"appProperties has { key='nfbArchiveKey' and value='%@' }", key]];
+    }
+    NSString *query = [NSString stringWithFormat:@"trashed = false and mimeType != 'application/vnd.google-apps.folder' and (%@)",
+        [terms componentsJoinedByString:@" or "]];
+    NSMutableOrderedSet *ids = [NSMutableOrderedSet orderedSet];
+    void (^finish)(NSString *) = ^(NSString *error) {
+        if (!error && ![self removeRecord:job]) error = @"Drive 已处理，但无法移除本机记录。请重试。";
+        self.removing = nil;
+        if (error) [NSNotificationCenter.defaultCenter postNotificationName:Changed object:nil];
+        completion(error);
+    };
+    [self collectTrashIDs:ids keys:keys query:query page:nil account:account completion:^(NSString *error) {
+        if (error) { finish(error); return; }
+        [self includeRecentUploads:job index:0 found:ids completion:^(NSString *lookupError) {
+            if (lookupError) finish(lookupError);
+            else [self trashIDs:ids.array index:0 account:account completion:finish];
+        }];
+    }];
+}
+
 - (void)run {
     if (self.active) return;
     for (NSMutableDictionary *job in self.jobs) {
-        if (![job[@"state"] isEqualToString:@"waiting"]) continue;
+        if (![job[@"state"] isEqualToString:@"waiting"] || [job[@"driveRemovalPending"] boolValue]) continue;
         self.active = job;
         self.generation++;
         if (![job[@"account"] isEqualToString:NFBDriveAuth.shared.account]) {
@@ -776,7 +971,7 @@ static NSDictionary *MatchingMedia(NSDictionary *old, NSArray *freshFiles, NSArr
 }
 
 static BOOL RefreshMissingMedia(NFBArchiveQueue *queue, NSMutableDictionary *job, NSArray *freshFiles) {
-    if (job == queue.active || [job[@"state"] isEqualToString:@"complete"]) return NO;
+    if (job == queue.active || [job[@"state"] isEqualToString:@"complete"] || [job[@"driveRemovalPending"] boolValue]) return NO;
     BOOL refreshed = NO;
     NSArray *oldFiles = job[@"files"];
     NSUInteger firstMedia = HasTextFile(job) && oldFiles.count ? 1 : 0;
@@ -939,6 +1134,13 @@ void NFBArchiveCaptureSections(id controller, NSArray *sections) {
 }
 
 - (void)togglePause {
+    NSDictionary *removing = NFBArchiveQueue.shared.removing;
+    if (self.paused && [removing[@"account"] isEqual:self.batch[@"account"]] &&
+        [removing[@"author"] isEqual:self.batch[@"author"]]) {
+        Message(self, @"暂时无法继续", @"请等待该博主的 Drive 删除操作完成。");
+        return;
+    }
+    if (self.paused) [self.processedPosts intersectSet:[NSSet setWithArray:self.batch[@"posts"]]];
     self.paused = !self.paused;
     self.lastAdvance = NSProcessInfo.processInfo.systemUptime;
     self.batch[@"state"] = self.paused ? @"paused" : @"scanning";
@@ -1120,6 +1322,10 @@ void NFBArchiveProfile(UIViewController *presenter, id author,
             return;
         }
         NFBArchiveQueue *queue = NFBArchiveQueue.shared;
+        if ([queue.removing[@"account"] isEqualToString:account] && [queue.removing[@"author"] isEqualToString:authorID]) {
+            Message(presenter, @"暂时无法归档", @"请等待该博主的 Drive 删除操作完成。");
+            return;
+        }
         NSMutableDictionary *batch = nil;
         for (NSMutableDictionary *item in queue.batches) {
             if ([item[@"account"] isEqualToString:account] && [item[@"author"] isEqualToString:authorID]) {
@@ -1160,6 +1366,48 @@ void NFBArchiveProfile(UIViewController *presenter, id author,
             }];
         });
     }]];
+    [presenter presentViewController:alert animated:YES completion:nil];
+}
+
+static void ConfirmArchiveRemoval(UIViewController *presenter, NSMutableDictionary *job, dispatch_block_t removed) {
+    NFBArchiveQueue *queue = NFBArchiveQueue.shared;
+    NSString *blocked = [queue removalBlocker:job];
+    if (blocked) { Message(presenter, @"暂时无法删除", blocked); return; }
+    NSString *explanation = @"「仅删除本机记录」保留 Drive 文件。\n「本机和 Drive 一起删除」会把这条帖子的归档文件移到 Drive 回收站，成功后再移除本机记录。";
+    if ([job[@"driveRemovalPending"] boolValue]) {
+        explanation = [@"上次 Drive 删除未完成。可以重试剩余文件，或只删除本机记录。\n\n" stringByAppendingString:explanation];
+    }
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"删除这条收藏？"
+        message:explanation preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"仅删除本机记录" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            NSString *currentBlocker = [queue removalBlocker:job];
+            if (currentBlocker) { Message(presenter, @"暂时无法删除", currentBlocker); return; }
+            if ([queue removeRecord:job]) removed();
+            else Message(presenter, @"未删除本机记录", @"无法写入本机收藏记录，请重试。");
+        });
+    }]];
+    UIAlertAction *cloud = [UIAlertAction actionWithTitle:@"本机和 Drive 一起删除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            UIBarButtonItem *button = presenter.navigationItem.rightBarButtonItem;
+            button.enabled = NO;
+            [queue trashArchive:job completion:^(NSString *error) {
+                button.enabled = YES;
+                if (error) {
+                    if ([presenter isKindOfClass:UITableViewController.class]) {
+                        [[(UITableViewController *)presenter tableView] reloadData];
+                    }
+                    Message(presenter, @"Drive 删除未完成", [error stringByAppendingString:@" 本机记录仍保留，可重新打开删除菜单重试。"]);
+                } else {
+                    removed();
+                }
+            }];
+        });
+    }];
+    cloud.enabled = [job[@"account"] isEqualToString:NFBDriveAuth.shared.account];
+    if (!cloud.enabled) alert.message = [explanation stringByAppendingString:@"\n\n登录收藏时使用的 Google 账号后，才能处理 Drive 文件。"];
+    [alert addAction:cloud];
     [presenter presentViewController:alert animated:YES completion:nil];
 }
 
@@ -1233,8 +1481,8 @@ void NFBArchiveProfile(UIViewController *presenter, id author,
     NSUInteger complete = 0, failed = 0;
     NSArray *jobs = [self jobsForBatch:batch];
     for (NSDictionary *job in jobs) {
-        if ([job[@"state"] isEqualToString:@"complete"]) complete++;
-        if ([job[@"state"] isEqualToString:@"failed"]) failed++;
+        if ([job[@"driveRemovalPending"] boolValue] || [job[@"state"] isEqualToString:@"failed"]) failed++;
+        else if ([job[@"state"] isEqualToString:@"complete"]) complete++;
     }
     BOOL scanned = [batch[@"state"] isEqualToString:@"scanned"];
     NSString *status = scanned && complete == [batch[@"posts"] count] ? @"已确认全部上传" :
@@ -1260,6 +1508,8 @@ void NFBArchiveProfile(UIViewController *presenter, id author,
     for (NSDictionary *file in job[@"files"]) if ([file[@"done"] boolValue]) done++;
     cell.textLabel.text = job[@"prefix"];
     NSString *message = job[@"message"] ?: @"";
+    if ([job[@"driveRemovalPending"] boolValue]) message = job == NFBArchiveQueue.shared.removing
+        ? @"正在移到 Drive 回收站" : @"Drive 删除未完成";
     NSURLSessionTask *network = NFBArchiveQueue.shared.network;
     if (job == NFBArchiveQueue.shared.active && [network isKindOfClass:NSURLSessionDownloadTask.class]) {
         int64_t received = network.countOfBytesReceived;
@@ -1290,7 +1540,8 @@ void NFBArchiveProfile(UIViewController *presenter, id author,
     for (NSDictionary *job in jobs) {
         NSString *state = job[@"state"];
         pending |= [state isEqualToString:@"running"] || [state isEqualToString:@"waiting"];
-        retryable |= [state isEqualToString:@"paused"] || [state isEqualToString:@"failed"];
+        retryable |= ![job[@"driveRemovalPending"] boolValue] &&
+                     ([state isEqualToString:@"paused"] || [state isEqualToString:@"failed"]);
         folder = folder ?: job[@"folder"];
     }
     if (pending) [alert addAction:[UIAlertAction actionWithTitle:@"暂停上传" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
@@ -1300,6 +1551,7 @@ void NFBArchiveProfile(UIViewController *presenter, id author,
     }]];
     if (retryable) [alert addAction:[UIAlertAction actionWithTitle:@"继续或重试上传" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
         for (NSMutableDictionary *job in jobs) {
+            if ([job[@"driveRemovalPending"] boolValue]) continue;
             if (![job[@"state"] isEqualToString:@"paused"] && ![job[@"state"] isEqualToString:@"failed"]) continue;
             for (NSMutableDictionary *file in job[@"files"]) [file removeObjectForKey:@"error"];
             [queue resume:job];
@@ -1311,6 +1563,19 @@ void NFBArchiveProfile(UIViewController *presenter, id author,
     }]];
     [alert addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (UISwipeActionsConfiguration *)tableView:(UITableView *)table trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (indexPath.section != 1) return nil;
+    NSMutableDictionary *job = NFBArchiveQueue.shared.jobs[indexPath.row];
+    UIContextualAction *remove = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleDestructive
+        title:@"删除…" handler:^(UIContextualAction *action, UIView *view, void (^completion)(BOOL)) {
+            completion(YES);
+            ConfirmArchiveRemoval(self, job, ^{ [self.tableView reloadData]; });
+        }];
+    UISwipeActionsConfiguration *config = [UISwipeActionsConfiguration configurationWithActions:@[remove]];
+    config.performsFirstActionWithFullSwipe = NO;
+    return config;
 }
 
 - (void)tableView:(UITableView *)table didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
@@ -1330,7 +1595,7 @@ void NFBArchiveProfile(UIViewController *presenter, id author,
     NSString *state = job[@"state"];
     if ([state isEqualToString:@"running"] || [state isEqualToString:@"waiting"]) {
         [alert addAction:[UIAlertAction actionWithTitle:@"暂停" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) { [queue pause:job]; }]];
-    } else if (![state isEqualToString:@"complete"]) {
+    } else if (![state isEqualToString:@"complete"] && ![job[@"driveRemovalPending"] boolValue]) {
         [alert addAction:[UIAlertAction actionWithTitle:[state isEqualToString:@"failed"] ? @"重试失败项" : @"继续"
             style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
                 for (NSMutableDictionary *file in job[@"files"]) [file removeObjectForKey:@"error"];
@@ -1513,9 +1778,9 @@ typedef void (^GalleryPreviewReply)(NSString *fileID, UIImage *image);
 
 @interface NFBArchiveGalleryController : UITableViewController
 @property (nonatomic, copy) NSString *authorID;
-@property (nonatomic, strong) NSDictionary *post;
+@property (nonatomic, strong) NSMutableDictionary *post;
 @property (nonatomic, copy) NSArray<NSDictionary *> *authors;
-@property (nonatomic, copy) NSArray<NSDictionary *> *posts;
+@property (nonatomic, copy) NSArray<NSMutableDictionary *> *posts;
 @end
 
 @implementation NFBArchiveGalleryController
@@ -1523,7 +1788,12 @@ typedef void (^GalleryPreviewReply)(NSString *fileID, UIImage *image);
     [super viewDidLoad];
     self.tableView.rowHeight = UITableViewAutomaticDimension;
     self.tableView.estimatedRowHeight = 84;
-    if (!self.authorID && !self.post) {
+    if (self.post) {
+        UIBarButtonItem *remove = [[UIBarButtonItem alloc] initWithTitle:@"删除收藏"
+            style:UIBarButtonItemStylePlain target:self action:@selector(removePost)];
+        remove.tintColor = UIColor.systemRedColor;
+        self.navigationItem.rightBarButtonItem = remove;
+    } else if (!self.authorID) {
         self.title = @"云收藏";
         self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"任务"
             style:UIBarButtonItemStylePlain target:self action:@selector(showTasks)];
@@ -1569,6 +1839,12 @@ typedef void (^GalleryPreviewReply)(NSString *fileID, UIImage *image);
     [self.navigationController pushViewController:ArchiveTaskList() animated:YES];
 }
 
+- (void)removePost {
+    ConfirmArchiveRemoval(self, self.post, ^{
+        if (self.navigationController.topViewController == self) [self.navigationController popViewControllerAnimated:YES];
+    });
+}
+
 - (NSInteger)tableView:(UITableView *)table numberOfRowsInSection:(NSInteger)section {
     if (self.post) {
         NSUInteger count = [self.post[@"files"] count];
@@ -1604,6 +1880,9 @@ typedef void (^GalleryPreviewReply)(NSString *fileID, UIImage *image);
         content.text = body.length ? body : @"媒体帖";
         content.textProperties.numberOfLines = 0;
         content.secondaryText = [@[job[@"folderName"], GalleryTimestamp(job)] componentsJoinedByString:@"\n"];
+        if ([job[@"driveRemovalPending"] boolValue]) {
+            content.secondaryText = [content.secondaryText stringByAppendingString:@"\nDrive 删除未完成，可再次选择「删除收藏」"];
+        }
         content.secondaryTextProperties.numberOfLines = 0;
         content.imageProperties.reservedLayoutSize = CGSizeZero;
         cell.accessoryType = UITableViewCellAccessoryNone;
@@ -1660,8 +1939,7 @@ typedef void (^GalleryPreviewReply)(NSString *fileID, UIImage *image);
         [NFBArchivePreviews.shared load:self.post index:index completion:^(NSString *fileID, UIImage *image) {
             NFBArchiveGalleryController *controller = weakSelf;
             if (controller.navigationController.topViewController != controller || !controller.viewIfLoaded.window) return;
-            if (!fileID.length || [fileID rangeOfCharacterFromSet:
-                    [[NSCharacterSet characterSetWithCharactersInString:@"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"] invertedSet]].location != NSNotFound) {
+            if (!ValidDriveID(fileID)) {
                 Message(controller, @"无法打开附件", @"请检查网络、Google 账号或 Drive 中的文件。");
                 return;
             }
@@ -1710,6 +1988,9 @@ void NFBArchivePost(UIViewController *presenter, id status) {
                 Message(presenter, @"无法创建收藏任务", @"请检查本机可用空间。");
                 return;
             }
+        } else if ([existing[@"driveRemovalPending"] boolValue]) {
+            Message(presenter, @"这条收藏有未完成的删除操作", @"请在云收藏或任务列表处理后再收藏。");
+            return;
         } else if (existing != queue.active && ![existing[@"state"] isEqualToString:@"complete"]) {
             BOOL refreshed = RefreshMissingMedia(queue, existing, snapshot[@"files"]);
             if (refreshed && ![queue save]) {
