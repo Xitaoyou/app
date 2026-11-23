@@ -8,6 +8,7 @@
 #import "Hooks/HookHelpers.h"
 
 static NSString * const Changed = @"NFBDriveArchiveChanged";
+static NSString * const OriginalPhotoPolicy = @"orig-v1";
 static const NSUInteger ChunkSize = 4 * 1024 * 1024;
 static UIViewController *ArchiveTaskList(void);
 
@@ -69,6 +70,44 @@ static NSURL *MediaURL(NSString *string) {
     return [url.scheme isEqualToString:@"https"] && [hosts containsObject:url.host.lowercaseString] ? url : nil;
 }
 
+static NSURL *OriginalPhotoURL(NSURL *url) {
+    if (![url.scheme isEqualToString:@"https"] || ![url.host.lowercaseString isEqualToString:@"pbs.twimg.com"] ||
+        url.user || url.password || url.port) return nil;
+    NSURLComponents *parts = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
+    NSArray *path = [parts.path componentsSeparatedByString:@"/"];
+    if (path.count != 3 || ![path[1] isEqualToString:@"media"]) return nil;
+    NSString *filename = [[path[2] componentsSeparatedByString:@":"] firstObject];
+    NSString *format = filename.pathExtension.lowercaseString;
+    NSString *identifier = format.length ? filename.stringByDeletingPathExtension : filename;
+    NSCharacterSet *invalid = [[NSCharacterSet characterSetWithCharactersInString:@"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"] invertedSet];
+    if (!identifier.length || [identifier rangeOfCharacterFromSet:invalid].location != NSNotFound) return nil;
+    NSMutableArray<NSURLQueryItem *> *query = [NSMutableArray array];
+    for (NSURLQueryItem *item in parts.queryItems) {
+        if ([item.name isEqualToString:@"format"]) {
+            if (item.value.length) format = item.value.lowercaseString;
+        } else if (![item.name isEqualToString:@"name"]) {
+            [query addObject:item];
+        }
+    }
+    if ([format isEqualToString:@"jpeg"]) format = @"jpg";
+    if (![@[@"jpg", @"png", @"webp", @"gif", @"avif"] containsObject:format ?: @""]) return nil;
+    [query addObject:[NSURLQueryItem queryItemWithName:@"format" value:format]];
+    [query addObject:[NSURLQueryItem queryItemWithName:@"name" value:@"orig"]];
+    parts.path = [@"/media/" stringByAppendingString:identifier];
+    parts.queryItems = query;
+    parts.fragment = nil;
+    return parts.URL;
+}
+
+static BOOL IsOriginalPhotoResponse(NSURL *requested, NSURL *actual) {
+    NSURL *canonical = OriginalPhotoURL(actual);
+    if (!canonical || ![requested.path isEqualToString:canonical.path]) return NO;
+    for (NSURLQueryItem *item in [NSURLComponents componentsWithURL:actual resolvingAgainstBaseURL:NO].queryItems) {
+        if ([item.name isEqualToString:@"name"]) return [item.value isEqualToString:@"orig"];
+    }
+    return [actual.path hasSuffix:@":orig"];
+}
+
 static NSArray *MediaFiles(id status) {
     id entities = ObjectValue(status, @"entities");
     NSArray *media = ObjectValue(entities, @"media");
@@ -84,7 +123,7 @@ static NSArray *MediaFiles(id status) {
         NSURL *playlist = nil;
         NSInteger type = [IntegerValue(item, @"mediaType") integerValue];
         if (type == 1) {
-            url = MediaURL(item.mediaURL);
+            url = OriginalPhotoURL(MediaURL(item.mediaURL));
         } else if (type == 2 || type == 3) {
             NSInteger best = -1;
             for (TFSTwitterEntityMediaVideoVariant *variant in item.videoInfo.variants) {
@@ -308,6 +347,10 @@ typedef void (^DriveReply)(NSDictionary *, NSHTTPURLResponse *, NSError *);
              completionHandler:(void (^)(NSURLRequest *))completionHandler {
     BOOL mediaRedirect = MediaURL(task.originalRequest.URL.absoluteString) &&
                          MediaURL(request.URL.absoluteString);
+    NSURL *original = OriginalPhotoURL(task.originalRequest.URL);
+    if (mediaRedirect && original && [original isEqual:task.originalRequest.URL]) {
+        mediaRedirect = IsOriginalPhotoResponse(original, request.URL);
+    }
     completionHandler(mediaRedirect ? request : nil);
 }
 
@@ -764,7 +807,7 @@ typedef void (^DriveReply)(NSDictionary *, NSHTTPURLResponse *, NSError *);
 
 - (void)find:(NSString *)key parent:(NSString *)parent completion:(void (^)(NSDictionary *))completion {
     NSString *query = DriveFileQuery(key, parent);
-    NSURLRequest *request = [NSURLRequest requestWithURL:API(@"/drive/v3/files", @{@"q": query, @"fields": @"files(id,name,size,mimeType,parents)", @"pageSize": @"100"})];
+    NSURLRequest *request = [NSURLRequest requestWithURL:API(@"/drive/v3/files", @{@"q": query, @"fields": @"files(id,name,size,mimeType,parents,appProperties)", @"pageSize": @"100"})];
     [self request:[request mutableCopy] reply:^(NSDictionary *json, NSHTTPURLResponse *response, NSError *error) {
         if (response.statusCode != 200 || ![json[@"files"] isKindOfClass:NSArray.class]) {
             [self driveFailure:json response:response operation:^{ [self find:key parent:parent completion:completion]; }]; return;
@@ -811,11 +854,10 @@ typedef void (^DriveReply)(NSDictionary *, NSHTTPURLResponse *, NSError *);
         if ([file[@"done"] boolValue] || [file[@"error"] length]) continue;
         self.active[@"fileIndex"] = @(index);
         self.recoveringExpiredUpload = NO;
+        if ([file[@"type"] integerValue] == 1 && ![self ensureOriginalPhoto:file index:index]) return;
         NSString *key = DriveFileKey(self.active, index);
         [self find:key parent:self.active[@"folder"] completion:^(NSDictionary *found) {
-            if ([found[@"id"] length] && [found[@"size"] longLongValue] > 0) {
-                [self finishFile:file driveID:found[@"id"]];
-            } else {
+            if (![self satisfyFromDrive:found file:file]) {
                 [self prepare:file key:key index:index];
             }
         }];
@@ -825,6 +867,50 @@ typedef void (^DriveReply)(NSDictionary *, NSHTTPURLResponse *, NSError *);
     for (NSDictionary *file in files) if (![file[@"done"] boolValue]) missing++;
     [self stop:missing ? @"failed" : @"complete"
         message:missing ? [NSString stringWithFormat:@"%lu 个文件未保存，点按查看和重试", (unsigned long)missing] : @"已确认全部上传到 Google Drive"];
+}
+
+- (BOOL)satisfyFromDrive:(NSDictionary *)found file:(NSMutableDictionary *)file {
+    NSString *driveID = found[@"id"];
+    BOOL photo = [file[@"type"] integerValue] == 1;
+    BOOL hasData = ValidDriveID(driveID) && [found[@"size"] longLongValue] > 0;
+    if (hasData && (!photo || [found[@"appProperties"][@"nfbPhotoQuality"] isEqualToString:OriginalPhotoPolicy])) {
+        [self finishFile:file driveID:driveID];
+        return YES;
+    }
+    if (!photo) return NO;
+    if (ValidDriveID(driveID) && ![found[@"mimeType"] hasPrefix:@"image/"]) {
+        [self recordFailure:file message:@"Drive 同一归档位置已有其他类型的文件，无法更新为原图"];
+        return YES;
+    }
+    NSString *replacement = ValidDriveID(driveID) ? driveID : nil;
+    NSString *previous = file[@"replaceDriveID"];
+    if (replacement != previous && ![replacement isEqualToString:previous]) {
+        [file removeObjectForKey:@"session"];
+        file[@"replaceDriveID"] = replacement;
+    }
+    return NO;
+}
+
+- (BOOL)ensureOriginalPhoto:(NSMutableDictionary *)file index:(NSUInteger)index {
+    NSURL *original = OriginalPhotoURL(MediaURL(file[@"source"]));
+    if (!original) {
+        [self recordFailure:file message:@"无法取得这张图片的原图地址，更新帖子后可重试"];
+        return NO;
+    }
+    if ([file[@"photoPolicy"] isEqualToString:OriginalPhotoPolicy] &&
+        [file[@"source"] isEqualToString:original.absoluteString]) return YES;
+    NSURL *local = [self localFile:index];
+    NSFileManager *manager = NSFileManager.defaultManager;
+    if ([manager fileExistsAtPath:local.path] && ![manager removeItemAtURL:local error:nil]) {
+        [self recordFailure:file message:@"无法清理旧画质的本机下载缓存"];
+        return NO;
+    }
+    [file removeObjectsForKeys:@[@"name", @"mime", @"session", @"downloadResume", @"replaceDriveID"]];
+    file[@"source"] = original.absoluteString;
+    file[@"photoPolicy"] = OriginalPhotoPolicy;
+    if ([self save]) return YES;
+    [self stop:@"failed" message:@"无法保存原图下载状态"];
+    return NO;
 }
 
 - (NSURL *)localFile:(NSUInteger)index {
@@ -856,6 +942,7 @@ typedef void (^DriveReply)(NSDictionary *, NSHTTPURLResponse *, NSError *);
     file[@"driveID"] = driveID;
     [file removeObjectForKey:@"session"];
     [file removeObjectForKey:@"downloadResume"];
+    [file removeObjectForKey:@"replaceDriveID"];
     self.retries = 0;
     self.recoveringExpiredUpload = NO;
     if (![self save]) { [self stop:@"failed" message:@"无法保存任务进度"]; return; }
@@ -921,13 +1008,16 @@ typedef void (^DriveReply)(NSDictionary *, NSHTTPURLResponse *, NSError *);
         return;
     }
     NSData *resume = file[@"downloadResume"] ? [[NSData alloc] initWithBase64EncodedString:file[@"downloadResume"] options:0] : nil;
+    BOOL photo = [file[@"type"] integerValue] == 1;
     void (^done)(NSURL *, NSURLResponse *, NSError *) = ^(NSURL *location, NSURLResponse *response, NSError *error) {
         // The download location expires when this callback returns.
         NSHTTPURLResponse *http = (NSHTTPURLResponse *)response;
         NSString *mime = response.MIMEType.lowercaseString;
         NSString *extension = MediaExtensions()[mime ?: @""];
         NSURL *temporary = nil;
-        if (!error && location && extension && http.statusCode >= 200 && http.statusCode < 300 && MediaURL(response.URL.absoluteString)) {
+        BOOL originalPhoto = !photo || ([mime hasPrefix:@"image/"] && IsOriginalPhotoResponse(source, response.URL));
+        if (!error && location && extension && http.statusCode >= 200 && http.statusCode < 300 &&
+            MediaURL(response.URL.absoluteString) && originalPhoto) {
             temporary = [local URLByAppendingPathExtension:NSUUID.UUID.UUIDString];
             if (![NSFileManager.defaultManager moveItemAtURL:location toURL:temporary error:nil]) temporary = nil;
         }
@@ -953,7 +1043,7 @@ typedef void (^DriveReply)(NSDictionary *, NSHTTPURLResponse *, NSError *);
                 if (checkpoint.length) file[@"downloadResume"] = [checkpoint base64EncodedStringWithOptions:0];
                 [self retry:@"媒体下载失败，请重试" operation:^{ [self prepare:file key:key index:index]; }];
             } else {
-                [self recordFailure:file message:@"媒体已失效，或返回了无法保存的格式"];
+                [self recordFailure:file message:photo ? @"X 未返回可保存的原图，可稍后重试" : @"媒体已失效，或返回了无法保存的格式"];
             }
         });
     };
@@ -980,13 +1070,19 @@ typedef void (^DriveReply)(NSDictionary *, NSHTTPURLResponse *, NSError *);
     if (!size) { [self recordFailure:file message:@"本机文件为空或丢失"]; return; }
 
     if (![file[@"session"] length]) {
-        NSMutableDictionary *body = [@{@"name": file[@"name"], @"parents": @[self.active[@"folder"]],
-            @"mimeType": file[@"mime"], @"appProperties": @{@"nfbArchiveKey": key}} mutableCopy];
+        NSString *replaceID = file[@"replaceDriveID"];
+        BOOL replace = ValidDriveID(replaceID);
+        NSMutableDictionary *properties = [@{@"nfbArchiveKey": key} mutableCopy];
+        if ([file[@"type"] integerValue] == 1) properties[@"nfbPhotoQuality"] = OriginalPhotoPolicy;
+        NSMutableDictionary *body = [@{@"name": file[@"name"], @"mimeType": file[@"mime"], @"appProperties": properties} mutableCopy];
+        if (!replace) body[@"parents"] = @[self.active[@"folder"]];
         if (!HasTextFile(self.active) && index == 0) {
             body[@"description"] = [NSString stringWithFormat:@"%@\n%@\n%@", self.active[@"folderName"],
                                     self.active[@"timestamp"], self.active[@"link"]];
         }
-        NSMutableURLRequest *request = [self JSONRequest:API(@"/upload/drive/v3/files", @{@"uploadType": @"resumable", @"fields": @"id,size"}) method:@"POST" body:body];
+        NSString *path = replace ? [@"/upload/drive/v3/files/" stringByAppendingString:replaceID] : @"/upload/drive/v3/files";
+        NSMutableURLRequest *request = [self JSONRequest:API(path, @{@"uploadType": @"resumable", @"fields": @"id,size"})
+                                                  method:replace ? @"PATCH" : @"POST" body:body];
         [request setValue:file[@"mime"] forHTTPHeaderField:@"X-Upload-Content-Type"];
         [request setValue:sizeValue.stringValue forHTTPHeaderField:@"X-Upload-Content-Length"];
         [self request:request reply:^(NSDictionary *json, NSHTTPURLResponse *response, NSError *error) {
@@ -1045,8 +1141,7 @@ typedef void (^DriveReply)(NSDictionary *, NSHTTPURLResponse *, NSError *);
             self.recoveringExpiredUpload = YES;
             [file removeObjectForKey:@"session"];
             [self find:key parent:self.active[@"folder"] completion:^(NSDictionary *found) {
-                if ([found[@"id"] length] && [found[@"size"] longLongValue] > 0) [self finishFile:file driveID:found[@"id"]];
-                else [self upload:file key:key index:index offset:nil];
+                if (![self satisfyFromDrive:found file:file]) [self upload:file key:key index:index offset:nil];
             }];
         } else {
             [self driveFailure:json response:response operation:^{ [self upload:file key:key index:index offset:nil]; }];
@@ -1086,14 +1181,17 @@ static char ArchiveScannerKey;
 static NSDictionary *MatchingMedia(NSDictionary *old, NSArray *freshFiles, NSArray *oldFiles) {
     NSString *identity = old[@"mediaID"];
     NSURL *oldURL = MediaURL(old[@"source"]);
+    NSURL *oldOriginal = [old[@"type"] integerValue] == 1 ? OriginalPhotoURL(oldURL) : nil;
     NSDictionary *onlyCandidate = nil;
     NSUInteger candidates = 0, oldCandidates = 0;
     for (NSDictionary *item in freshFiles) {
         NSURL *newURL = MediaURL(item[@"source"]);
         if (!newURL || ![old[@"type"] isEqual:item[@"type"]]) continue;
         if (identity.length && [identity isEqualToString:item[@"mediaID"]]) return item;
-        if ((!identity.length || ![item[@"mediaID"] length]) && oldURL &&
-            [oldURL.host isEqualToString:newURL.host] && [oldURL.path isEqualToString:newURL.path]) return item;
+        if (!identity.length || ![item[@"mediaID"] length]) {
+            NSURL *comparable = oldOriginal ?: oldURL;
+            if ([comparable.host isEqualToString:newURL.host] && [comparable.path isEqualToString:newURL.path]) return item;
+        }
         onlyCandidate = item;
         candidates++;
     }
@@ -1115,16 +1213,15 @@ static BOOL RefreshMissingMedia(NFBArchiveQueue *queue, NSMutableDictionary *job
         NSMutableDictionary *file = oldFiles[index];
         if ([file[@"done"] boolValue]) continue;
         NSURL *local = [queue localFileForJob:job index:index];
-        if ([NSFileManager.defaultManager fileExistsAtPath:local.path] &&
+        BOOL cacheMatchesPolicy = [file[@"type"] integerValue] != 1 || [file[@"photoPolicy"] isEqualToString:OriginalPhotoPolicy];
+        if (cacheMatchesPolicy && [NSFileManager.defaultManager fileExistsAtPath:local.path] &&
             ([file[@"mime"] length] || DownloadedMediaType(local))) continue;
         NSDictionary *fresh = MatchingMedia(file, freshFiles, oldMedia);
         if (!fresh || [fresh[@"source"] isEqualToString:file[@"source"]]) continue;
         file[@"source"] = fresh[@"source"];
         file[@"playlist"] = fresh[@"playlist"] ?: @NO;
         file[@"mediaID"] = fresh[@"mediaID"] ?: @"";
-        [file removeObjectForKey:@"downloadResume"];
-        [file removeObjectForKey:@"session"];
-        [file removeObjectForKey:@"error"];
+        [file removeObjectsForKeys:@[@"downloadResume", @"session", @"error", @"photoPolicy"]];
         refreshed = YES;
     }
     return refreshed;
