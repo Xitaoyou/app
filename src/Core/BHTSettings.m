@@ -9,6 +9,20 @@
 #import "Core/BHTBundle.h"
 #import "Core/BHTManager.h"
 
+// The legacy build can reuse preferences from another build of this app.
+// Keep incompatible controls inert even when an imported backup enables them.
+static BOOL BHTLegacySettingUnavailable(NSString* key) {
+    static NSSet<NSString*>* unsupported;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        unsupported = [NSSet setWithArray:@[@"ipad_split_view", @"no_tab_bar_hiding", @"copy_profile_info",
+            @"hide_typing_indicator", @"block_screenshot_detection", @"blue_launch_screen",
+            @"liquid_glass", @"hide_grok_analyze", @"hide_grok_sidebar", @"hide_grok_create",
+            @"bypass_age_verification", @"disable_double_tap_like"]];
+    });
+    return [unsupported containsObject:key ?: @""];
+}
+
 static NSDictionary<NSString*, NSDictionary*>* BHTSettingsPages(void) {
     static NSDictionary<NSString*, NSDictionary*>* pages;
     static dispatch_once_t onceToken;
@@ -603,7 +617,11 @@ static NSDictionary<NSString*, NSDictionary*>* BHTSettingsIndex(void) {
 #pragma mark - Accessors
 
 + (NSArray<NSDictionary*>*)settingsForPage:(NSString*)pageKey {
-    return pageKey ? BHTSettingsPages()[pageKey][@"settings"] : nil;
+    if (!pageKey) return nil;
+    NSArray<NSDictionary*>* settings = BHTSettingsPages()[pageKey][@"settings"];
+    return [settings filteredArrayUsingPredicate:[NSPredicate predicateWithBlock:^BOOL(NSDictionary* row, NSDictionary* bindings) {
+        return !BHTLegacySettingUnavailable(row[@"key"]);
+    }]];
 }
 
 + (NSString*)titleKeyForPage:(NSString*)pageKey {
@@ -644,6 +662,7 @@ static NSDictionary<NSString*, NSDictionary*>* BHTSettingsIndex(void) {
 }
 
 + (BOOL)boolForKey:(NSString*)key {
+    if (BHTLegacySettingUnavailable(key)) return NO;
     id value = [[NSUserDefaults standardUserDefaults] objectForKey:key];
     if (value != nil) {
         return [value boolValue];
@@ -652,6 +671,7 @@ static NSDictionary<NSString*, NSDictionary*>* BHTSettingsIndex(void) {
 }
 
 + (NSInteger)integerForKey:(NSString*)key {
+    if (BHTLegacySettingUnavailable(key)) return 0;
     id value = [[NSUserDefaults standardUserDefaults] objectForKey:key];
     if (value != nil) {
         return [value integerValue];

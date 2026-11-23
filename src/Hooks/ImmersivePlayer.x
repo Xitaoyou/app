@@ -143,17 +143,7 @@ enum {
 
 %end
 
-%hook T1ImmersiveViewController
 
-- (BOOL)isCurrentCardDockEligible {
-    if ([BHTSettings boolForKey:@"disable_video_docking"]) {
-        return NO;
-    }
-
-    return %orig;
-}
-
-%end
 
 %hook T1ImmersiveViewControllerV2
 
@@ -194,14 +184,6 @@ static BOOL isUpwardPan(UIGestureRecognizer* gesture) {
             return NO;
         }
         return YES;
-    }
-
-    return %orig;
-}
-
-- (BOOL)allowsUpwardSwipeToDismiss {
-    if ([BHTSettings boolForKey:@"disable_immersive_scroll"]) {
-        return NO;
     }
 
     return %orig;

@@ -74,7 +74,7 @@ static TFNSettingsNavigationItem* makeNeoFreeBirdSettingsItem(
             return [BHTManager BHTSettingsWithAccount:account];
         }];
 
-    if (twitterIcon) {
+    if (twitterIcon && [bhtwitter respondsToSelector:@selector(setIcon:)]) {
         [bhtwitter setValue:twitterIcon forKey:@"icon"];
     }
 
@@ -85,8 +85,10 @@ static TFNSettingsNavigationItem* makeNeoFreeBirdSettingsItem(
 
 static NSArray* sectionsByInsertingEntry(TFNItemsDataViewController* settingsVC,
                                          NSArray* sections) {
+    TFNSettingsNavigationItem* entry = makeNeoFreeBirdSettingsItem(settingsVC);
+    if (!entry) return sections;
     NSMutableArray* newSections = [sections mutableCopy] ?: [NSMutableArray array];
-    [newSections insertObject:@[makeNeoFreeBirdSettingsItem(settingsVC)] atIndex:0];
+    [newSections insertObject:@[entry] atIndex:0];
     return newSections;
 }
 

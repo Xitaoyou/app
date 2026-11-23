@@ -766,14 +766,6 @@ static NSArray* orderedTabEntries(NSArray* entries) {
 
 // The scroll-driven hide only reaches the tab bar as a collapse ratio, so
 // clamping it spares the deliberate hides (fullscreen media, immersive player).
-- (void)setTabBarCollapseRatio:(double)ratio {
-    if ([BHTSettings boolForKey:@"no_tab_bar_hiding"]) {
-        %orig(0.0);
-    } else {
-        %orig(ratio);
-    }
-}
-
 %end
 
 // MARK: - Tab bar icon and label theming

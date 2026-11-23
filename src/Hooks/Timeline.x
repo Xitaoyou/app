@@ -764,35 +764,13 @@ static id RemoveVideoCarouselEntries(id node, BOOL* removed) {
 %hook TFNItemsDataViewController
 
 - (void)setSections:(NSArray*)sections restoreScrollPosition:(BOOL)restoreScrollPosition {
-    NSArray* mediaSections = BHProfileMediaNativeSections(self, sections);
-    if (mediaSections) {
-        BHProfileMediaWillApplySections(self);
-        @try {
-            %orig(mediaSections, restoreScrollPosition);
-        } @finally {
-            BHProfileMediaDidApplySections(self);
-        }
-    } else {
-        %orig(FilteredTimelineSections(self, sections), restoreScrollPosition);
-    }
+    %orig(FilteredTimelineSections(self, sections), restoreScrollPosition);
 }
 
 - (void)updateSections:(NSArray*)sections
-    reconfigureItemIdentifiers:(NSArray*)identifiers
               withRowAnimation:(long long)animation
-                    completion:(id)completion {
-    NSArray* mediaSections = BHProfileMediaNativeSections(self, sections);
-    if (mediaSections) {
-        id mergedIdentifiers = BHProfileMediaReconfigureIdentifiers(mediaSections, identifiers);
-        BHProfileMediaWillApplySections(self);
-        @try {
-            %orig(mediaSections, mergedIdentifiers, animation, completion);
-        } @finally {
-            BHProfileMediaDidApplySections(self);
-        }
-    } else {
-        %orig(FilteredTimelineSections(self, sections), identifiers, animation, completion);
-    }
+                    completion:(void (^)(void))completion {
+    %orig(FilteredTimelineSections(self, sections), animation, completion);
 }
 
 %end

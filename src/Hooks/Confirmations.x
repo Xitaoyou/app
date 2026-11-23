@@ -170,10 +170,6 @@ static BOOL FastBlockEnabled(void) {
 
 %hook TFNTwitterAccount
 
-- (BOOL)isXDSAlertBlockUserEnabled {
-    return FastBlockEnabled() ? NO : %orig;
-}
-
 - (BOOL)shouldDisplayUserMuteConfirmationAlert {
     return FastBlockEnabled() ? NO : %orig;
 }

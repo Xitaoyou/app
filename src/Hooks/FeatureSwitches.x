@@ -553,10 +553,6 @@ static NSNumber* FeatureSwitchOverrideValueForKey(NSString* key) {
 
 %hook TFSAccountFeatureSwitches
 
-- (BOOL)isAutoplayBackgroundAudioSuppressionEnabled {
-    return NO;
-}
-
 // Sets the scroll indicator in -[TFNDataViewController loadView]; the read
 // bypasses the boolForKey: funnels above via a Swift access-once provider.
 + (BOOL)isShowsVerticalScrollIndicatorEnabled {
@@ -617,17 +613,7 @@ static NSNumber* FeatureSwitchOverrideValueForKey(NSString* key) {
 
 %end
 
-%hook T1HostViewController
 
-- (void)makeOnboardingViewControllerWithCompletion:(void (^)(id))completion {
-    if (completion == nil) {
-        %orig;
-        return;
-    }
-    completion([WebLoginViewController loginRootNavigationController]);
-}
-
-%end
 
 // MARK: - High quality images
 
@@ -684,10 +670,6 @@ static NSNumber* FeatureSwitchOverrideValueForKey(NSString* key) {
                : %orig;
 }
 
-- (BOOL)isAgeAssuranceAgeVerificationFlowEnabled {
-    return [BHTSettings boolForKey:@"bypass_age_verification"] ? NO : %orig;
-}
-
 - (BOOL)isVideoDynamicAdEnabled {
     return [BHTSettings boolForKey:@"hide_promoted"] ? NO : %orig;
 }
@@ -699,13 +681,6 @@ static NSNumber* FeatureSwitchOverrideValueForKey(NSString* key) {
 // Custom navigation: the Money tab's gate, granted per account/region by the
 // server, forced on like the switch-keyed tab gates so the panel's entry
 // builds.
-- (BOOL)canAccessXPayments {
-    if (ReportGenuineTabGates) {
-        return %orig;
-    }
-    return YES;
-}
-
 %end
 
 // MARK: - Genuine subscription status
@@ -717,14 +692,6 @@ static NSNumber* FeatureSwitchOverrideValueForKey(NSString* key) {
 %hook T1AppServicesManager
 
 // Sets the account's tier as a Braze attribute on every activation.
-- (id)_brazeTierStringForAccount:(id)account {
-    BOOL saved = ReportGenuineSubscription;
-    ReportGenuineSubscription = YES;
-    id result = %orig;
-    ReportGenuineSubscription = saved;
-    return result;
-}
-
 %end
 
 %hook T1TabbedAppNavigation
@@ -913,13 +880,7 @@ static NSArray* panelIDsForDashSnapshot(NSArray* panelIDs) {
 // The photo editor's Edit with Grok entry has no feature switch of its own;
 // both delegates hardcode YES.
 
-%hook T1TweetComposeViewController
 
-- (BOOL)photoEditorCanEditWithGrok:(id)photoEditor {
-    return [BHTSettings boolForKey:@"hide_grok_create"] ? NO : %orig;
-}
-
-%end
 
 %hook T1StatusPhotoEditorHandler
 
@@ -1004,13 +965,7 @@ static __thread NSUInteger NFBLiquidGlassInstallationDepth;
 
 %end
 
-%hook TFNTwitterAccount
 
-- (BOOL)isDummyTest1FeatureEnabled {
-    return NFBLiquidGlassInstallationDepth ? NFBLiquidGlassEnabled() : %orig;
-}
-
-%end
 
 %hook _TtC14T1TwitterSwift27LiquidGlassRedesignFeatures
 

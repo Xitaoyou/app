@@ -191,15 +191,6 @@
 // Both content updates and layout use this setter, so later frame-based
 // visibility updates cannot undo the preference. Native visibility is retained
 // when the preference is off, including for cached and reused author rows.
-- (void)_t1_screenshots_modified_setHidden:(BOOL)hidden view:(UIView*)view {
-    if (view && view == self.messageButton &&
-        [BHTSettings boolForKey:@"hide_message_button"]) {
-        hidden = YES;
-        view.userInteractionEnabled = NO;
-    }
-    %orig(hidden, view);
-}
-
 %end
 
 // Hiding views also requires hooking the footer, and X is being weird and making it
@@ -220,25 +211,6 @@
     } @finally {
         footerItem.viewCount = viewCount;
     }
-}
-
-+ (CGSize)sizeForViewModel:(id)model
-                          footerItem:(T1ConversationFooterItem*)footerItem
-                        maximumWidth:(CGFloat)width
-    grokEditImageButtonConfiguration:(id)configuration {
-    if (![BHTSettings boolForKey:@"hide_view_count"] || !footerItem) {
-        return %orig;
-    }
-
-    NSNumber* viewCount = footerItem.viewCount;
-    footerItem.viewCount = nil;
-    CGSize size;
-    @try {
-        size = %orig;
-    } @finally {
-        footerItem.viewCount = viewCount;
-    }
-    return size;
 }
 
 %end

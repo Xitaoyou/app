@@ -1,4 +1,4 @@
-name: Build Tweak
+name: Build NeoFreeBird Legacy 10.79.2
 
 on:
   workflow_dispatch:
@@ -114,10 +114,10 @@ jobs:
       - name: Validate private base IPA URL
         if: inputs.deploy_format == 'sideloaded' || inputs.deploy_format == 'trollstore'
         env:
-          IPA_URL: ${{ secrets.NFB_DECRYPTED_IPA_URL }}
+          IPA_URL: ${{ secrets.NFB_DECRYPTED_IPA_URL_10_79_2 }}
         run: |
           if [ -z "$IPA_URL" ]; then
-            echo "::error::Set the repository secret NFB_DECRYPTED_IPA_URL to a private direct-download IPA URL."
+            echo "::error::Set the repository secret NFB_DECRYPTED_IPA_URL_10_79_2 to the legacy base IPA URL."
             exit 1
           fi
 
@@ -145,20 +145,14 @@ jobs:
             echo "::error::Expected bundle ID com.atebits.Tweetie2, got $BUNDLE_ID."
             exit 1
           fi
-          if [ "$X_VERSION" != "12.42.1" ]; then
-            echo "::error::Expected X version 12.42.1, got $X_VERSION."
+          if [ "$X_VERSION" != "10.79.2" ]; then
+            echo "::error::Expected X version 10.79.2, got $X_VERSION."
             exit 1
           fi
           echo "version=${X_VERSION}" >> "$GITHUB_OUTPUT"
           echo "$X_VERSION"
-          if [ -n "$NFB_DRIVE_IOS_CLIENT_ID" ]; then
-            python3 main/tools/configure-drive-oauth.py
-            (cd main/tmp && zip -q ../packages/com.atebits.Tweetie2.ipa Payload/Twitter.app/Info.plist)
-          fi
         env:
-          IPA_URL: ${{ secrets.NFB_DECRYPTED_IPA_URL }}
-          NFB_DRIVE_IOS_CLIENT_ID: ${{ vars.NFB_DRIVE_IOS_CLIENT_ID }}
-          NFB_DRIVE_IOS_BUNDLE_ID: ${{ vars.NFB_DRIVE_IOS_BUNDLE_ID }}
+          IPA_URL: ${{ secrets.NFB_DECRYPTED_IPA_URL_10_79_2 }}
 
       - name: Prepare Image Pack
         if: inputs.resource_pack_url != '' && (inputs.deploy_format == 'sideloaded' || inputs.deploy_format == 'trollstore')
@@ -202,10 +196,15 @@ jobs:
         if: inputs.deploy_format == 'sideloaded' || inputs.deploy_format == 'trollstore'
         run: |
           mv "main/packages/$(ls -t main/packages | head -n1)" \
-             "main/packages/${{ steps.tweak_info.outputs.name }}-${BRANDING}-${{ inputs.deploy_format }}_${{ steps.tweak_info.outputs.version }}_${{ steps.x_version.outputs.version }}.${IPA_EXT}"
+             "main/packages/${{ steps.tweak_info.outputs.name }}-Legacy-${{ inputs.deploy_format }}_${{ steps.tweak_info.outputs.version }}_${{ steps.x_version.outputs.version }}.${IPA_EXT}"
         env:
           IPA_EXT: ${{ inputs.deploy_format == 'trollstore' && 'tipa' || 'ipa' }}
           BRANDING: ${{ inputs.twitter_branding && 'Twitter' || 'X' }}
+
+      - name: Verify legacy IPA
+        if: inputs.deploy_format == 'sideloaded'
+        run: |
+          python3 main/tools/verify-legacy-ipa.py "main/packages/NeoFreeBird-Legacy-sideloaded_${{ steps.tweak_info.outputs.version }}_10.79.2.ipa" | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Pass package name
         id: package_name
@@ -214,13 +213,15 @@ jobs:
 
 
       - name: Create Draft Release
-        if: ${{ inputs.create_release }}
+        if: ${{ inputs.create_release && inputs.deploy_format == 'sideloaded' }}
         id: create_release
         uses: softprops/action-gh-release@v3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: v${{ steps.tweak_info.outputs.version }}
-          name: v${{ steps.tweak_info.outputs.version }} - ${{ steps.tweak_info.outputs.name }}
+          tag_name: legacy-x-10.79.2-nfb-7.3.1-r1
+          target_commitish: ${{ github.event.inputs.commit_id || github.sha }}
+          name: NeoFreeBird 7.3.1 for X 10.79.2 (Legacy)
+          body: First compatibility build for X 10.79.2. Uses the app's native Media. Google Drive archive is available on the 12.42.1 branch. See LEGACY.md for compatibility and test coverage.
           files: main/packages/${{ steps.package_name.outputs.package }}
           draft: true

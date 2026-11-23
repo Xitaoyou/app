@@ -149,11 +149,9 @@ static NSArray* FilteredSections(TFNItemsDataViewController* dataViewController,
 }
 
 - (void)updateSections:(NSArray*)sections
-    reconfigureItemIdentifiers:(NSArray*)identifiers
               withRowAnimation:(long long)animation
-                    completion:(id)completion {
-    %orig(FilteredSections(self, sections), identifiers, animation,
-              completion);
+                    completion:(void (^)(void))completion {
+    %orig(FilteredSections(self, sections), animation, completion);
 }
 
 %end

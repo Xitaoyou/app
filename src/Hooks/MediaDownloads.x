@@ -5,7 +5,6 @@
 
 #import <objc/runtime.h>
 #import "HookHelpers.h"
-#import "Archive/NFBDriveArchive.h"
 
 static NSURL* nfbLastCapturedVoiceURL = nil;
 
@@ -394,21 +393,6 @@ static void SetVoiceDownloadLongPressRecognizer(UIView* view,
                      scribeComponent:(__unsafe_unretained id)scribeComponent
                            doneBlock:(__unsafe_unretained id)doneBlock {
     NSArray* origItems = %orig;
-
-    if (status && [status respondsToSelector:@selector(statusID)] && %c(TFNActionItem)) {
-        id archiveStatus = status;
-        __weak UIViewController* presenter = self;
-        TFNActionItem* archiveItem = [%c(TFNActionItem)
-            actionItemWithTitle:@"收藏到 Google Drive" imageName:@"bookmark_stroke" action:^{
-                UIViewController* controller = presenter;
-                if (controller) dispatch_async(dispatch_get_main_queue(), ^{ NFBArchivePost(controller, archiveStatus); });
-            }];
-        if (archiveItem) {
-            NSMutableArray* items = origItems ? [origItems mutableCopy] : [NSMutableArray array];
-            [items insertObject:archiveItem atIndex:items.count ? items.count - 1 : 0];
-            origItems = [items copy];
-        }
-    }
 
     if (![BHTSettings boolForKey:@"download_videos"] ||
         ![status respondsToSelector:@selector(entities)]) {

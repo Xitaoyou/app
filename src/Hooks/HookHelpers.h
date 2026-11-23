@@ -42,13 +42,6 @@ void MarkEmptiedModuleChrome(NSArray* items, NSMutableIndexSet* removed);
 // Live square-avatar restyling (Avatars.x)
 void applySquareAvatarsSetting(void);
 
-// Native Photos + Videos presentation (ProfileMedia.x / Timeline.x).
-// nil means the controller is not participating in the native media union.
-NSArray* BHProfileMediaNativeSections(id viewController, NSArray* sections);
-id BHProfileMediaReconfigureIdentifiers(NSArray* sections, id nativeIdentifiers);
-void BHProfileMediaWillApplySections(id viewController);
-void BHProfileMediaDidApplySections(id viewController);
-
 NSString* formatNumberWithSuffix(long long number);
 
 bool NFBLiquidGlassEnabled(void);
