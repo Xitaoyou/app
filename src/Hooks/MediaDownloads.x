@@ -380,10 +380,61 @@ static void SetVoiceDownloadLongPressRecognizer(UIView* view,
 }
 %end
 
-// MARK: - Tweet video download
+// MARK: - Post sharing
+
+// The recipient tray uses this action list for the buttons along its bottom edge.
+%group NFBPostShareTray
+%hook UIViewController
+- (NSArray*)_t1_shareSheetInAppActionItemsForShareable:(id)shareable
+                                              account:(id)account
+                                          actionItems:(id)actionItems {
+    NSArray* original = %orig;
+    if (![shareable respondsToSelector:@selector(statusID)] ||
+        ![shareable respondsToSelector:@selector(fromUser)] ||
+        (original && ![original isKindOfClass:NSArray.class])) return original;
+
+    __weak UIViewController* presenter = self;
+    TFNActionItem* archive = [%c(TFNActionItem)
+        actionItemWithTitle:@"收藏到 Drive" imageName:@"bookmark_stroke" action:^{
+            dispatch_async(dispatch_get_main_queue(), ^{
+                UIViewController* controller = presenter;
+                if (!controller.viewIfLoaded.window) return;
+                void (^afterDismissal)(void) = ^{
+                    if (controller.viewIfLoaded.window && !controller.presentedViewController) {
+                        NFBArchivePost(controller, shareable);
+                    }
+                };
+
+                UIViewController* shown = controller.presentedViewController;
+                if (!shown) {
+                    afterDismissal();
+                } else if (shown.isBeingDismissed && shown.transitionCoordinator) {
+                    [shown.transitionCoordinator animateAlongsideTransition:nil
+                        completion:^(id<UIViewControllerTransitionCoordinatorContext> context) {
+                            dispatch_async(dispatch_get_main_queue(), afterDismissal);
+                        }];
+                } else {
+                    UIViewController* content = [shown isKindOfClass:UINavigationController.class]
+                        ? [(UINavigationController*)shown topViewController] : shown;
+                    Class sheet = objc_getClass("_TtC10ShareSheet24ShareSheetViewController");
+                    Class tray = objc_getClass("_TtC10ShareSheet35ShareSheetTrayContentViewController");
+                    if ([content isKindOfClass:sheet] || [content isKindOfClass:tray]) {
+                        [shown dismissViewControllerAnimated:YES completion:afterDismissal];
+                    }
+                }
+            });
+        }];
+    if (!archive) return original;
+
+    NSMutableArray* items = [original mutableCopy] ?: [NSMutableArray array];
+    [items insertObject:archive atIndex:MIN((NSUInteger)1, items.count)];
+    return [items copy];
+}
+%end
+%end
 
 // _t1_actionItemsForStatus:... is a category method on UIViewController, so the
-// hook has to land on the base class to cover every share/action sheet.
+// older post action sheet can keep its existing archive and download actions.
 %hook UIViewController
 - (NSArray*)_t1_actionItemsForStatus:(__unsafe_unretained id)status
                              account:(__unsafe_unretained id)account
@@ -449,3 +500,12 @@ static void SetVoiceDownloadLongPressRecognizer(UIView* view,
     return newItems;
 }
 %end
+
+%ctor {
+    %init;
+    SEL shareActions = @selector(_t1_shareSheetInAppActionItemsForShareable:account:actionItems:);
+    if (class_getInstanceMethod(UIViewController.class, shareActions) &&
+        [objc_getClass("TFNActionItem") respondsToSelector:@selector(actionItemWithTitle:imageName:action:)]) {
+        %init(NFBPostShareTray);
+    }
+}
