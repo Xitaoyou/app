@@ -12,6 +12,15 @@
       "versions": [
         {
           "version": "12.42.1",
+          "buildVersion": "4",
+          "date": "2026-11-23T22:26:53Z",
+          "downloadURL": "https://github.com/Xitaoyou/app/releases/download/sidestore-x-12.42.1-r4/NeoFreeBird-Twitter-sideloaded_7.3.1_12.42.1_build4.ipa",
+          "size": 281710226,
+          "minOSVersion": "15.0",
+          "localizedDescription": "云收藏长按直接进入多选。可批量删除帖子或整个博主的收藏，也可将对应 Drive 归档移到回收站。"
+        },
+        {
+          "version": "12.42.1",
           "buildVersion": "3",
           "date": "2026-11-23T22:07:58Z",
           "downloadURL": "https://github.com/Xitaoyou/app/releases/download/sidestore-x-12.42.1-r3/NeoFreeBird-Twitter-sideloaded_7.3.1_12.42.1_build3.ipa",
