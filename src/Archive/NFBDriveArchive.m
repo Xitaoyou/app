@@ -108,6 +108,16 @@ static BOOL IsOriginalPhotoResponse(NSURL *requested, NSURL *actual) {
     return [actual.path hasSuffix:@":orig"];
 }
 
+static BOOL BetterVideo(long long pixels, long long bitrate, long long bestPixels, long long bestBitrate) {
+    if (pixels != bestPixels) return pixels > bestPixels;
+    return bitrate > bestBitrate;
+}
+
+static long long VideoPixels(NSString *url) {
+    NSArray *size = [[BHTManager getVideoQuality:url] componentsSeparatedByString:@"x"];
+    return size.count == 2 ? [size[0] longLongValue] * [size[1] longLongValue] : 0;
+}
+
 static NSArray *MediaFiles(id status) {
     id entities = ObjectValue(status, @"entities");
     NSArray *media = ObjectValue(entities, @"media");
@@ -121,19 +131,23 @@ static NSArray *MediaFiles(id status) {
         }
         NSURL *url = nil;
         NSURL *playlist = nil;
+        long long bestPixels = 0, bestBitrate = 0;
         NSInteger type = [IntegerValue(item, @"mediaType") integerValue];
         if (type == 1) {
             url = OriginalPhotoURL(MediaURL(item.mediaURL));
         } else if (type == 2 || type == 3) {
-            NSInteger best = -1;
             for (TFSTwitterEntityMediaVideoVariant *variant in item.videoInfo.variants) {
                 NSURL *candidate = MediaURL(variant.url);
                 if (!candidate) continue;
                 if ([candidate.pathExtension.lowercaseString isEqualToString:@"m3u8"] && !playlist) playlist = candidate;
                 if (![variant.contentType isEqualToString:@"video/mp4"]) continue;
-                NSArray *dimensions = [[BHTManager getVideoQuality:variant.url] componentsSeparatedByString:@"x"];
-                NSInteger pixels = dimensions.count == 2 ? [dimensions[0] integerValue] * [dimensions[1] integerValue] : 0;
-                if (pixels > best) { best = pixels; url = candidate; }
+                long long pixels = VideoPixels(variant.url);
+                long long bitrate = [IntegerValue(variant, @"bitrate") longLongValue];
+                if (!url || BetterVideo(pixels, bitrate, bestPixels, bestBitrate)) {
+                    bestPixels = pixels;
+                    bestBitrate = bitrate;
+                    url = candidate;
+                }
             }
         }
         if (!playlist && (type == 2 || type == 3)) {
@@ -147,6 +161,8 @@ static NSArray *MediaFiles(id status) {
         }
         [files addObject:[@{@"source": (url ?: playlist).absoluteString ?: @"", @"type": @(type),
                             @"mediaID": identity ?: @"",
+                            @"playlistSource": playlist.absoluteString ?: @"",
+                            @"videoPixels": @(bestPixels), @"videoBitrate": @(bestBitrate),
                             @"playlist": @(!url && playlist != nil)} mutableCopy]];
     }
     return files;
@@ -284,7 +300,7 @@ typedef void (^DriveReply)(NSDictionary *, NSHTTPURLResponse *, NSError *);
 @property (nonatomic, strong) NSMutableDictionary *active;
 @property (nonatomic, strong) NSMutableDictionary *removing;
 @property (nonatomic, strong) NSURLSessionTask *network;
-@property (nonatomic, strong) FFmpegSession *mediaSession;
+@property (nonatomic, strong) AbstractSession *mediaSession;
 @property (nonatomic) NSUInteger generation;
 @property (nonatomic) NSUInteger retries;
 @property (nonatomic) BOOL retriedAuth;
@@ -950,6 +966,46 @@ typedef void (^DriveReply)(NSDictionary *, NSHTTPURLResponse *, NSError *);
     [self nextFile];
 }
 
+- (void)selectVideoForFile:(NSMutableDictionary *)file playlist:(NSURL *)playlist key:(NSString *)key index:(NSUInteger)index {
+    NSUInteger generation = self.generation;
+    self.active[@"message"] = @"正在比较视频画质";
+    if (![self save]) { [self stop:@"failed" message:@"无法保存视频选择进度"]; return; }
+    self.mediaSession = [FFprobeKit executeWithArgumentsAsync:@[
+        @"-v", @"error", @"-protocol_whitelist", @"https,tls,tcp,crypto",
+        @"-rw_timeout", @"12000000", @"-show_programs", @"-of", @"json", playlist.absoluteString
+    ] withCompleteCallback:^(FFprobeSession *session) {
+        NSData *data = [[session getOutput] dataUsingEncoding:NSUTF8StringEncoding];
+        id json = data.length ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (generation != self.generation || !self.active) return;
+            self.mediaSession = nil;
+            NSDictionary *best = nil;
+            long long bestPixels = 0, bestBitrate = 0;
+            NSArray *programs = [json isKindOfClass:NSDictionary.class] ? json[@"programs"] : nil;
+            for (NSDictionary *program in programs) {
+                if (![program[@"program_id"] isKindOfClass:NSNumber.class]) continue;
+                for (NSDictionary *stream in program[@"streams"]) {
+                    if (![stream[@"codec_type"] isEqualToString:@"video"]) continue;
+                    long long pixels = [stream[@"width"] longLongValue] * [stream[@"height"] longLongValue];
+                    long long bitrate = [stream[@"bit_rate"] longLongValue] ?: [program[@"tags"][@"variant_bitrate"] longLongValue];
+                    if (pixels > 0 && (!best || BetterVideo(pixels, bitrate, bestPixels, bestBitrate))) {
+                        best = program;
+                        bestPixels = pixels;
+                        bestBitrate = bitrate;
+                    }
+                }
+            }
+            long long mp4Pixels = [file[@"videoPixels"] longLongValue] ?: VideoPixels(file[@"source"]);
+            BOOL hlsOnly = [file[@"playlist"] boolValue];
+            BOOL useHLS = hlsOnly || (best && BetterVideo(bestPixels, bestBitrate, mp4Pixels, [file[@"videoBitrate"] longLongValue]));
+            file[@"selectedPlaylist"] = @(useHLS);
+            if (useHLS && best) file[@"videoProgram"] = best[@"program_id"];
+            if (![self save]) { [self stop:@"failed" message:@"无法保存视频画质选择"]; return; }
+            [self prepare:file key:key index:index];
+        });
+    }];
+}
+
 - (void)prepare:(NSMutableDictionary *)file key:(NSString *)key index:(NSUInteger)index {
     NSURL *local = [self localFile:index];
     if (file[@"text"] && ![NSFileManager.defaultManager fileExistsAtPath:local.path]) {
@@ -976,15 +1032,30 @@ typedef void (^DriveReply)(NSDictionary *, NSHTTPURLResponse *, NSError *);
 
     NSURL *source = MediaURL(file[@"source"]);
     if (!source) { [self recordFailure:file message:@"此附件没有可保存的媒体文件地址"]; return; }
+    NSURL *playlist = MediaURL(file[@"playlistSource"]);
+    if (!playlist && [file[@"playlist"] boolValue]) playlist = source;
+    if (playlist && [file[@"type"] integerValue] == 3 && !file[@"selectedPlaylist"]) {
+        [self selectVideoForFile:file playlist:playlist key:key index:index];
+        return;
+    }
+    BOOL usePlaylist = [file[@"selectedPlaylist"] boolValue] || [file[@"playlist"] boolValue];
+    if (usePlaylist && playlist) source = playlist;
     self.active[@"message"] = [NSString stringWithFormat:@"下载附件 %lu", (unsigned long)index];
     if (![self save]) { [self stop:@"failed" message:@"无法保存下载进度"]; return; }
     NSUInteger generation = self.generation;
-    if ([file[@"playlist"] boolValue]) {
+    if (usePlaylist) {
         NSURL *temporary = [local URLByAppendingPathExtension:[NSUUID.UUID.UUIDString stringByAppendingString:@".mp4"]];
-        self.mediaSession = [FFmpegKit executeWithArgumentsAsync:@[
-            @"-nostdin", @"-protocol_whitelist", @"https,tls,tcp,crypto", @"-i", source.absoluteString,
-            @"-map", @"0:v:0", @"-map", @"0:a:0?", @"-c", @"copy", @"-movflags", @"+faststart", temporary.path
-        ] withCompleteCallback:^(FFmpegSession *session) {
+        NSMutableArray *args = [@[@"-nostdin", @"-protocol_whitelist", @"https,tls,tcp,crypto",
+            @"-rw_timeout", @"15000000", @"-i", source.absoluteString] mutableCopy];
+        NSNumber *program = file[@"videoProgram"];
+        if (program) {
+            NSString *prefix = [NSString stringWithFormat:@"0:p:%@", program];
+            [args addObjectsFromArray:@[@"-map", [prefix stringByAppendingString:@":v:0"],
+                                       @"-map", [prefix stringByAppendingString:@":a:0?"]]];
+        }
+        // Without program data FFmpeg selects the highest-resolution video automatically.
+        [args addObjectsFromArray:@[@"-sn", @"-dn", @"-c", @"copy", @"-movflags", @"+faststart", temporary.path]];
+        self.mediaSession = [FFmpegKit executeWithArgumentsAsync:args withCompleteCallback:^(FFmpegSession *session) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 if (generation != self.generation || !self.active) {
                     [NSFileManager.defaultManager removeItemAtURL:temporary error:nil];
@@ -1163,7 +1234,10 @@ static void Message(UIViewController *presenter, NSString *title, NSString *mess
 static char ArchiveScannerKey;
 
 @interface NFBArchiveScanner : UIViewController
-@property (nonatomic, copy) NSArray<UIViewController *> *sources;
+@property (nonatomic, strong) NSMutableArray *sources;
+@property (nonatomic, copy) NSArray *sourceFactories;
+@property (nonatomic, strong) NSMutableIndexSet *retrySources;
+@property (nonatomic, strong) NSMutableIndexSet *retriedSources;
 @property (nonatomic, strong) NSMutableDictionary *batch;
 @property (nonatomic, strong) NSMutableArray *states;
 @property (nonatomic, strong) NSMapTable *raw;
@@ -1174,6 +1248,7 @@ static char ArchiveScannerKey;
 @property (nonatomic, copy) NSArray *lastSignature;
 @property (nonatomic) NSTimeInterval lastAdvance;
 @property (nonatomic) NSTimeInterval lastScroll;
+@property (nonatomic) NSTimeInterval lastTick;
 @property (nonatomic) NSUInteger sourceIndex;
 @property (nonatomic) BOOL paused;
 @end
@@ -1217,11 +1292,18 @@ static BOOL RefreshMissingMedia(NFBArchiveQueue *queue, NSMutableDictionary *job
         if (cacheMatchesPolicy && [NSFileManager.defaultManager fileExistsAtPath:local.path] &&
             ([file[@"mime"] length] || DownloadedMediaType(local))) continue;
         NSDictionary *fresh = MatchingMedia(file, freshFiles, oldMedia);
-        if (!fresh || [fresh[@"source"] isEqualToString:file[@"source"]]) continue;
+        if (!fresh) continue;
+        BOOL sourceChanged = ![fresh[@"source"] isEqualToString:file[@"source"]];
+        BOOL playlistChanged = [file[@"type"] integerValue] == 3 && [fresh[@"playlistSource"] length] &&
+                               ![fresh[@"playlistSource"] isEqualToString:file[@"playlistSource"]];
+        if (!sourceChanged && !playlistChanged) continue;
         file[@"source"] = fresh[@"source"];
         file[@"playlist"] = fresh[@"playlist"] ?: @NO;
         file[@"mediaID"] = fresh[@"mediaID"] ?: @"";
-        [file removeObjectsForKeys:@[@"downloadResume", @"session", @"error", @"photoPolicy"]];
+        file[@"playlistSource"] = fresh[@"playlistSource"] ?: @"";
+        file[@"videoPixels"] = fresh[@"videoPixels"] ?: @0;
+        file[@"videoBitrate"] = fresh[@"videoBitrate"] ?: @0;
+        [file removeObjectsForKeys:@[@"downloadResume", @"session", @"error", @"photoPolicy", @"selectedPlaylist", @"videoProgram"]];
         refreshed = YES;
     }
     return refreshed;
@@ -1268,6 +1350,8 @@ void NFBArchiveCaptureSections(id controller, NSArray *sections) {
     self.raw = [NSMapTable weakToStrongObjectsMapTable];
     self.initialized = [NSHashTable weakObjectsHashTable];
     self.processedPosts = [NSMutableSet set];
+    self.retrySources = [NSMutableIndexSet indexSet];
+    self.retriedSources = [NSMutableIndexSet indexSet];
     self.states = [@[@"等待", @"等待"] mutableCopy];
     self.label = [[UILabel alloc] init];
     self.label.numberOfLines = 0;
@@ -1310,11 +1394,14 @@ void NFBArchiveCaptureSections(id controller, NSArray *sections) {
     UIViewController *source = self.sources[self.sourceIndex];
     self.lastSignature = nil;
     self.lastAdvance = NSProcessInfo.processInfo.systemUptime;
+    self.lastTick = self.lastAdvance;
     self.lastScroll = 0;
-    self.states[self.sourceIndex] = @"正在加载";
+    [self.processedPosts removeAllObjects];
+    self.states[self.sourceIndex] = [self.retriedSources containsIndex:self.sourceIndex] ? @"正在重试" : @"正在加载";
+    self.batch[@"sources"] = [self.states copy];
     SEL setter = @selector(setLoadingDelegate:);
-    if (![source respondsToSelector:setter]) {
-        [self stop:@"incomplete" message:@"无法观察原生列表的首次加载"];
+    if (![source isKindOfClass:objc_getClass("T1URTViewController")] || source.parentViewController || ![source respondsToSelector:setter]) {
+        [self finishSource:@"列表不可用" retry:NO];
         return;
     }
     NSHashTable *owners = [NSHashTable weakObjectsHashTable];
@@ -1338,7 +1425,7 @@ void NFBArchiveCaptureSections(id controller, NSArray *sections) {
 }
 
 - (void)unmountSource:(UIViewController *)source {
-    if (source.parentViewController != self) return;
+    if (![source isKindOfClass:UIViewController.class] || source.parentViewController != self) return;
     objc_setAssociatedObject(source, &ArchiveScannerKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     SEL setter = @selector(setLoadingDelegate:);
     if ([source respondsToSelector:setter]) ((void (*)(id, SEL, id))objc_msgSend)(source, setter, nil);
@@ -1394,6 +1481,7 @@ void NFBArchiveCaptureSections(id controller, NSArray *sections) {
     for (UIViewController *source in self.sources) [self unmountSource:source];
     self.batch[@"state"] = state;
     self.batch[@"message"] = message;
+    self.batch[@"sources"] = [self.states copy];
     if (![NFBArchiveQueue.shared save]) message = @"无法保存扫描进度";
     self.label.text = [NSString stringWithFormat:@"%@\n\n%@", [self summary], message];
     self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"查看任务"
@@ -1401,11 +1489,53 @@ void NFBArchiveCaptureSections(id controller, NSArray *sections) {
     [NFBArchiveQueue.shared run];
 }
 
+- (void)finishSource:(NSString *)status retry:(BOOL)retry {
+    NSUInteger finished = self.sourceIndex;
+    self.states[finished] = status;
+    if (retry && ![self.retriedSources containsIndex:finished]) [self.retrySources addIndex:finished];
+    self.batch[@"sources"] = [self.states copy];
+    if (![NFBArchiveQueue.shared save]) { [self stop:@"incomplete" message:@"无法保存分页进度"]; return; }
+    [self unmountSource:self.sources[finished]];
+
+    if (finished == 0 && [self.states[1] isEqualToString:@"等待"]) {
+        self.sourceIndex = 1;
+        [self mountSource];
+        return;
+    }
+    NSUInteger next = self.retrySources.firstIndex;
+    if (next != NSNotFound) {
+        [self.retrySources removeIndex:next];
+        [self.retriedSources addIndex:next];
+        self.sourceIndex = next;
+        NSString *rowPrefix = [NSString stringWithFormat:@"row:%lu:", (unsigned long)next];
+        NSMutableArray *remaining = [NSMutableArray array];
+        for (NSString *key in self.batch[@"unreadable"]) if (![key hasPrefix:rowPrefix]) [remaining addObject:key];
+        self.batch[@"unreadable"] = remaining;
+        UIViewController *(^factory)(void) = self.sourceFactories[next];
+        UIViewController *fresh = factory();
+        if (fresh == self.sources[1 - next] || fresh == self.sources[next]) fresh = nil;
+        self.sources[next] = fresh ?: (id)NSNull.null;
+        [self mountSource];
+        return;
+    }
+    if (![self.states[0] isEqualToString:@"已到尾"] || ![self.states[1] isEqualToString:@"已到尾"]) {
+        [self stop:@"incomplete" message:@"已保留并排队上传找到的帖子。未到尾的列表可从该主页重新扫描。"];
+    } else if ([self.batch[@"unreadable"] count]) {
+        [self stop:@"incomplete" message:[NSString stringWithFormat:@"%lu 个媒体条目无法确认，已保留可用项目",
+                                           (unsigned long)[self.batch[@"unreadable"] count]]];
+    } else {
+        [self stop:@"scanned" message:@"两路扫描完成。上传结果可在任务中心查看。"];
+    }
+}
+
 - (void)tick {
     if (self.paused || UIApplication.sharedApplication.applicationState != UIApplicationStateActive) return;
     if (![NFBDriveAuth.shared.account isEqualToString:self.batch[@"account"]]) {
         [self stop:@"incomplete" message:@"Google 账号已切换"]; return;
     }
+    NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
+    if (now - self.lastTick > 5.0) self.lastAdvance = now;
+    self.lastTick = now;
     UIViewController *source = self.sources[self.sourceIndex];
     NSArray *sections = [self.raw objectForKey:source];
     BOOL initialized = [self.initialized containsObject:source];
@@ -1456,9 +1586,10 @@ void NFBArchiveCaptureSections(id controller, NSArray *sections) {
             if ([IntegerValue(model, @"isRetweet") boolValue]) continue;
             NSString *authorID = [IntegerValue(model, @"fromUserID") stringValue];
             if (authorID.length && ![authorID isEqualToString:self.batch[@"author"]]) continue;
-            NSArray *assets = MediaFiles(model);
             NSDictionary *snapshot = Snapshot(model);
-            if (![snapshot[@"author"] isEqualToString:self.batch[@"author"]] || !assets.count) {
+            NSArray *files = snapshot[@"files"];
+            NSUInteger mediaCount = files.count - (files.count && HasTextFile(snapshot) ? 1 : 0);
+            if (![snapshot[@"author"] isEqualToString:self.batch[@"author"]] || !mediaCount) {
                 if ([known containsObject:postID]) continue;
                 if (![unreadable containsObject:postID]) {
                     [unreadable addObject:postID];
@@ -1467,11 +1598,20 @@ void NFBArchiveCaptureSections(id controller, NSArray *sections) {
                 continue;
             }
             NSMutableDictionary *job = ArchiveJob(queue, snapshot, self.batch[@"account"]);
-            changed |= RefreshMissingMedia(queue, job, snapshot[@"files"]);
+            if (RefreshMissingMedia(queue, job, files)) {
+                changed = YES;
+                if ([job[@"state"] isEqualToString:@"failed"]) {
+                    job[@"state"] = @"waiting";
+                    job[@"message"] = @"已更新媒体链接，等待上传";
+                }
+            }
             [self.processedPosts addObject:postID];
+            if ([unreadable containsObject:postID]) {
+                [unreadable removeObject:postID];
+                changed = YES;
+            }
             if ([known containsObject:postID]) continue;
             [known addObject:postID];
-            [unreadable removeObject:postID];
             changed = YES;
         }
     }
@@ -1482,49 +1622,38 @@ void NFBArchiveCaptureSections(id controller, NSArray *sections) {
         [queue run];
     }
 
-    NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
     if (![self.lastSignature isEqualToArray:signature]) {
         self.lastSignature = [signature copy];
         self.lastAdvance = now;
     }
     SEL tail = @selector(tfn_isContentScrolledToBottom);
     SEL scroll = @selector(scrollViewDidScroll:);
-    UITableView *table = ObjectValue(source, @"tableView");
-    if (![table isKindOfClass:UITableView.class] || ![source respondsToSelector:tail] ||
-        ![source respondsToSelector:scroll]) {
-        [self stop:@"incomplete" message:@"当前媒体列表不支持原生分页检查"]; return;
-    }
-    if (error) { [self stop:@"incomplete" message:@"X 返回了分页错误，请从该主页重试"]; return; }
-    if (initialized && sections &&
+    UIScrollView *content = ObjectValue(source, @"tfn_contentScrollView") ?:
+        ObjectValue(source, @"tableViewIfLoaded") ?: ObjectValue(source, @"collectionViewIfLoaded");
+    BOOL canPage = [content isKindOfClass:UIScrollView.class] &&
+                   [source respondsToSelector:tail] && [source respondsToSelector:scroll];
+    if (error) { [self finishSource:@"分页失败" retry:YES]; return; }
+    if (initialized && sections && canPage &&
         ((BOOL (*)(id, SEL))objc_msgSend)(source, tail)) {
-        self.states[self.sourceIndex] = @"已到尾";
-        self.batch[@"sources"] = [self.states copy];
-        if (![queue save]) { [self stop:@"incomplete" message:@"无法保存分页进度"]; return; }
-        [self unmountSource:source];
-        if (self.sourceIndex == 0) {
-            self.sourceIndex = 1;
-            [self mountSource];
-        } else {
-            [self stop:unreadable.count ? @"incomplete" : @"scanned"
-                message:unreadable.count ? [NSString stringWithFormat:@"%lu 个媒体条目无法确认，已保留可用项目", (unsigned long)unreadable.count] :
-                    @"两路扫描完成。上传结果可在任务中心查看。"];
-        }
+        [self finishSource:@"已到尾" retry:NO];
         return;
     }
-    if (now - self.lastAdvance > 45) {
-        [self stop:@"incomplete" message:@"X 分页没有继续推进，也未返回到尾信号。请从主页重试。"];
+    if (now - self.lastAdvance > 30) {
+        [self finishSource:initialized ? (canPage ? @"分页超时" : @"分页不可用") : @"加载超时" retry:YES];
         return;
     }
-    if ([self.initialized containsObject:source] && now - self.lastScroll >= 2.0) {
+    if (initialized && canPage && now - self.lastScroll >= 2.0) {
         self.lastScroll = now;
         self.states[self.sourceIndex] = @"扫描中";
-        UIEdgeInsets inset = table.adjustedContentInset;
-        CGFloat bottom = MAX(-inset.top, table.contentSize.height - table.bounds.size.height + inset.bottom);
-        if (fabs(table.contentOffset.y - bottom) > 0.5) {
-            [table setContentOffset:CGPointMake(table.contentOffset.x, bottom) animated:NO];
-        } else {
-            ((void (*)(id, SEL, id))objc_msgSend)(source, scroll, table);
+        [source.view layoutIfNeeded];
+        [content layoutIfNeeded];
+        UIEdgeInsets inset = content.adjustedContentInset;
+        CGFloat bottom = MAX(-inset.top, ceil(content.contentSize.height - content.bounds.size.height + inset.bottom));
+        if (fabs(content.contentOffset.y - bottom) > 0.01) {
+            [content setContentOffset:CGPointMake(content.contentOffset.x, bottom) animated:NO];
+            [content layoutIfNeeded];
         }
+        ((void (*)(id, SEL, id))objc_msgSend)(source, scroll, content);
     }
     self.label.text = [self summary];
 }
@@ -1545,8 +1674,9 @@ void NFBArchiveProfile(UIViewController *presenter, id author,
         if (!account.length) return;
         UIViewController *photoSource = photos(), *videoSource = videos();
         Class native = objc_getClass("T1URTViewController");
-        if (!native || ![photoSource isKindOfClass:native] || ![videoSource isKindOfClass:native] ||
-            photoSource == videoSource || photoSource.parentViewController || videoSource.parentViewController) {
+        if (!native || ((![photoSource isKindOfClass:native] || photoSource.parentViewController) &&
+                        (![videoSource isKindOfClass:native] || videoSource.parentViewController)) ||
+            (photoSource && photoSource == videoSource)) {
             Message(presenter, @"无法归档", @"未能创建两路独立的原生媒体列表。");
             return;
         }
@@ -1578,7 +1708,8 @@ void NFBArchiveProfile(UIViewController *presenter, id author,
         if (![queue save]) { Message(presenter, @"无法归档", @"无法保存任务，请检查本机空间。"); return; }
 
         NFBArchiveScanner *scanner = [NFBArchiveScanner new];
-        scanner.sources = @[photoSource, videoSource];
+        scanner.sources = [@[photoSource ?: (id)NSNull.null, videoSource ?: (id)NSNull.null] mutableCopy];
+        scanner.sourceFactories = @[[photos copy], [videos copy]];
         scanner.batch = batch;
         DisplayScanner(presenter, scanner);
     };
