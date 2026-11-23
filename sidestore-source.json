@@ -12,6 +12,15 @@
       "versions": [
         {
           "version": "12.42.1",
+          "buildVersion": "5",
+          "date": "2026-11-23T22:38:18Z",
+          "downloadURL": "https://github.com/Xitaoyou/app/releases/download/sidestore-x-12.42.1-r5/NeoFreeBird-Twitter-sideloaded_7.3.1_12.42.1_build5.ipa",
+          "size": 281716680,
+          "minOSVersion": "15.0",
+          "localizedDescription": "单帖收藏和一键归档均保存 X 提供的原始尺寸图片。原图不可用时会显示失败，可重试。"
+        },
+        {
+          "version": "12.42.1",
           "buildVersion": "4",
           "date": "2026-11-23T22:26:53Z",
           "downloadURL": "https://github.com/Xitaoyou/app/releases/download/sidestore-x-12.42.1-r4/NeoFreeBird-Twitter-sideloaded_7.3.1_12.42.1_build4.ipa",
