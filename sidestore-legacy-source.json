@@ -1,0 +1,25 @@
+{
+  "name": "NeoFreeBird X Legacy · Xitaoyou",
+  "identifier": "io.github.xitaoyou.neofreebird.x.legacy",
+  "iconURL": "https://raw.githubusercontent.com/Xitaoyou/app/271467c147f5d5bd83c7254fa82041b85d154ede/resources/x_icon_rounded.png",
+  "apps": [
+    {
+      "name": "NeoFreeBird X Legacy",
+      "bundleIdentifier": "com.atebits.Tweetie2",
+      "developerName": "Xitaoyou / NeoFreeBird contributors",
+      "localizedDescription": "X 10.79.2 的 NeoFreeBird 7.3.1 侧载版，保留旧版原生 Media。",
+      "iconURL": "https://raw.githubusercontent.com/Xitaoyou/app/271467c147f5d5bd83c7254fa82041b85d154ede/resources/x_icon_rounded.png",
+      "versions": [
+        {
+          "version": "10.79.2",
+          "date": "2026-11-23T12:19:05Z",
+          "downloadURL": "https://github.com/Xitaoyou/app/releases/download/legacy-x-10.79.2-nfb-7.3.1-r1/NeoFreeBird-Legacy-sideloaded_7.3.1_10.79.2.ipa",
+          "size": 163888342,
+          "minOSVersion": "15.0",
+          "localizedDescription": "旧版兼容版。移植 NeoFreeBird 7.3.1 核心功能，使用 X 10.79.2 原生 Media。"
+        }
+      ]
+    }
+  ],
+  "news": []
+}
