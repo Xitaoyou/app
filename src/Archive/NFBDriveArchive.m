@@ -9,6 +9,7 @@
 
 static NSString * const Changed = @"NFBDriveArchiveChanged";
 static const NSUInteger ChunkSize = 4 * 1024 * 1024;
+static UIViewController *ArchiveTaskList(void);
 
 static const char *ReturnType(id object, SEL selector) {
     Method method = object ? class_getInstanceMethod(object_getClass(object), selector) : NULL;
@@ -48,6 +49,18 @@ static NSString *SafeName(NSString *value, NSUInteger limit) {
     if (clean.length <= limit) return clean;
     NSRange last = [clean rangeOfComposedCharacterSequenceAtIndex:limit];
     return [clean substringToIndex:last.location];
+}
+
+static NSString *ArchiveNamePrefix(NSString *value, NSUInteger byteLimit) {
+    NSUInteger end = 0, bytes = 0;
+    while (end < value.length) {
+        NSRange character = [value rangeOfComposedCharacterSequenceAtIndex:end];
+        NSUInteger length = [[value substringWithRange:character] lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
+        if (length > byteLimit - bytes) break;
+        bytes += length;
+        end = NSMaxRange(character);
+    }
+    return [[value substringToIndex:end] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
 }
 
 static NSURL *MediaURL(NSString *string) {
@@ -122,23 +135,66 @@ static NSDictionary *Snapshot(id status) {
     if (![date isKindOfClass:NSDate.class]) {
         date = [NSDate dateWithTimeIntervalSince1970:((postID.unsignedLongLongValue >> 22) + 1288834974657ULL) / 1000.0];
     }
-    NSString *timestamp = [[NSISO8601DateFormatter new] stringFromDate:date];
+    NSISO8601DateFormatter *formatter = [NSISO8601DateFormatter new];
+    formatter.timeZone = [NSTimeZone timeZoneForSecondsFromGMT:0];
+    NSString *timestamp = [formatter stringFromDate:date];
+    if (timestamp.length < 20) return nil;
     NSString *link = [NSString stringWithFormat:@"https://x.com/i/status/%@", postID];
     NSArray *assets = MediaFiles(status);
     if (!assets) return nil;
-    NSString *title = SafeName(body, 56);
+    NSString *fileTime = [[[[timestamp substringToIndex:19] stringByReplacingOccurrencesOfString:@"T" withString:@" "]
+                           stringByReplacingOccurrencesOfString:@":" withString:@"-"] stringByAppendingString:@"Z"];
+    NSString *authorAndPost = [NSString stringWithFormat:@" (@%@) [%@]", handle, postID];
+    NSString *longestExtension = [NSString stringWithFormat:@" - %02lu.avif", (unsigned long)MAX(1, assets.count)];
+    NSUInteger overhead = [[NSString stringWithFormat:@"%@ %@%@", fileTime, authorAndPost, longestExtension]
+                           lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
+    NSUInteger titleBudget = 240 - MIN(240, overhead);
+    NSString *safeBody = SafeName(body, body.length);
+    BOOL nameFits = [body isEqualToString:safeBody] &&
+                    [body lengthOfBytesUsingEncoding:NSUTF8StringEncoding] <= titleBudget;
+    BOOL hasDownloadableMedia = NO;
+    for (NSDictionary *asset in assets) {
+        if ([asset[@"source"] length]) {
+            hasDownloadableMedia = YES;
+            break;
+        }
+    }
+    BOOL needsTextFile = !hasDownloadableMedia || !nameFits;
+    NSString *title = nameFits ? body : ArchiveNamePrefix(safeBody, titleBudget);
     if (!title.length) {
         NSArray *types = @[@"媒体", @"照片", @"GIF", @"视频"];
         NSUInteger type = [assets.firstObject[@"type"] unsignedIntegerValue];
-        title = type < types.count ? types[type] : @"媒体";
+        title = !assets.count ? @"帖子" : type < types.count ? types[type] : @"媒体";
     }
-    NSString *prefix = [NSString stringWithFormat:@"%@ %@ [%@]", [timestamp substringToIndex:10], title, postID];
+    NSString *prefix = [NSString stringWithFormat:@"%@ %@%@", fileTime, title, authorAndPost];
     NSString *content = [NSString stringWithFormat:@"%@ (@%@)\n%@\n%@\n\n%@\n", name, handle, timestamp, link, body];
-    NSMutableArray *files = [NSMutableArray arrayWithObject:[@{@"name": [prefix stringByAppendingString:@".txt"],
-                                                               @"text": content, @"mime": @"text/plain"} mutableCopy]];
+    NSMutableArray *files = [NSMutableArray array];
+    if (needsTextFile) {
+        [files addObject:[@{@"name": [prefix stringByAppendingString:@".txt"],
+                            @"text": content, @"mime": @"text/plain"} mutableCopy]];
+    }
     [files addObjectsFromArray:assets];
     return @{@"post": postID.stringValue, @"author": authorID.stringValue, @"prefix": prefix, @"files": files,
+             @"body": body, @"timestamp": timestamp, @"link": link, @"hasTextFile": @(needsTextFile),
              @"folderName": [NSString stringWithFormat:@"%@ (@%@)", SafeName(name, 48), handle]};
+}
+
+// Older jobs always had a text file at index zero. Keep the Drive keys and
+// attachment numbers stable even when a new job omits that file.
+static BOOL HasTextFile(NSDictionary *job) {
+    return !job[@"hasTextFile"] || [job[@"hasTextFile"] boolValue];
+}
+
+static NSUInteger DriveFileIndex(NSDictionary *job, NSUInteger index) {
+    return HasTextFile(job) ? index : index + 1;
+}
+
+static NSString *DriveFileKey(NSDictionary *job, NSUInteger index) {
+    return [NSString stringWithFormat:@"post-%@-%lu", job[@"post"], (unsigned long)DriveFileIndex(job, index)];
+}
+
+static NSString *DriveFileQuery(NSString *key, NSString *parent) {
+    return [NSString stringWithFormat:@"trashed = false and '%@' in parents and appProperties has { key='nfbArchiveKey' and value='%@' }", parent, key];
 }
 
 static NSURL *API(NSString *path, NSDictionary *query) {
@@ -380,7 +436,7 @@ typedef void (^DriveReply)(NSDictionary *, NSHTTPURLResponse *, NSError *);
 }
 
 - (void)find:(NSString *)key parent:(NSString *)parent completion:(void (^)(NSDictionary *))completion {
-    NSString *query = [NSString stringWithFormat:@"trashed = false and '%@' in parents and appProperties has { key='nfbArchiveKey' and value='%@' }", parent, key];
+    NSString *query = DriveFileQuery(key, parent);
     NSURLRequest *request = [NSURLRequest requestWithURL:API(@"/drive/v3/files", @{@"q": query, @"fields": @"files(id,name,size,mimeType,parents)", @"pageSize": @"100"})];
     [self request:[request mutableCopy] reply:^(NSDictionary *json, NSHTTPURLResponse *response, NSError *error) {
         if (response.statusCode != 200 || ![json[@"files"] isKindOfClass:NSArray.class]) {
@@ -428,10 +484,10 @@ typedef void (^DriveReply)(NSDictionary *, NSHTTPURLResponse *, NSError *);
         if ([file[@"done"] boolValue] || [file[@"error"] length]) continue;
         self.active[@"fileIndex"] = @(index);
         self.recoveringExpiredUpload = NO;
-        NSString *key = [NSString stringWithFormat:@"post-%@-%lu", self.active[@"post"], (unsigned long)index];
+        NSString *key = DriveFileKey(self.active, index);
         [self find:key parent:self.active[@"folder"] completion:^(NSDictionary *found) {
             if ([found[@"id"] length] && [found[@"size"] longLongValue] > 0) {
-                [self finishFile:file];
+                [self finishFile:file driveID:found[@"id"]];
             } else {
                 [self prepare:file key:key index:index];
             }
@@ -456,7 +512,7 @@ typedef void (^DriveReply)(NSDictionary *, NSHTTPURLResponse *, NSError *);
 - (BOOL)saveMediaMetadata:(NSMutableDictionary *)file mime:(NSString *)mime index:(NSUInteger)index {
     file[@"mime"] = mime;
     file[@"name"] = [NSString stringWithFormat:@"%@ - %02lu.%@", self.active[@"prefix"],
-                     (unsigned long)index, MediaExtensions()[mime]];
+                     (unsigned long)DriveFileIndex(self.active, index), MediaExtensions()[mime]];
     [file removeObjectForKey:@"downloadResume"];
     return [self save];
 }
@@ -468,8 +524,9 @@ typedef void (^DriveReply)(NSDictionary *, NSHTTPURLResponse *, NSError *);
     [self nextFile];
 }
 
-- (void)finishFile:(NSMutableDictionary *)file {
+- (void)finishFile:(NSMutableDictionary *)file driveID:(NSString *)driveID {
     file[@"done"] = @YES;
+    file[@"driveID"] = driveID;
     [file removeObjectForKey:@"session"];
     [file removeObjectForKey:@"downloadResume"];
     self.retries = 0;
@@ -596,8 +653,12 @@ typedef void (^DriveReply)(NSDictionary *, NSHTTPURLResponse *, NSError *);
     if (!size) { [self recordFailure:file message:@"本机文件为空或丢失"]; return; }
 
     if (![file[@"session"] length]) {
-        NSDictionary *body = @{@"name": file[@"name"], @"parents": @[self.active[@"folder"]],
-                               @"mimeType": file[@"mime"], @"appProperties": @{@"nfbArchiveKey": key}};
+        NSMutableDictionary *body = [@{@"name": file[@"name"], @"parents": @[self.active[@"folder"]],
+            @"mimeType": file[@"mime"], @"appProperties": @{@"nfbArchiveKey": key}} mutableCopy];
+        if (!HasTextFile(self.active) && index == 0) {
+            body[@"description"] = [NSString stringWithFormat:@"%@\n%@\n%@", self.active[@"folderName"],
+                                    self.active[@"timestamp"], self.active[@"link"]];
+        }
         NSMutableURLRequest *request = [self JSONRequest:API(@"/upload/drive/v3/files", @{@"uploadType": @"resumable", @"fields": @"id,size"}) method:@"POST" body:body];
         [request setValue:file[@"mime"] forHTTPHeaderField:@"X-Upload-Content-Type"];
         [request setValue:sizeValue.stringValue forHTTPHeaderField:@"X-Upload-Content-Length"];
@@ -642,7 +703,7 @@ typedef void (^DriveReply)(NSDictionary *, NSHTTPURLResponse *, NSError *);
         NSInteger code = response.statusCode;
         if ((code == 200 || code == 201) && [json[@"id"] length] && [json[@"size"] longLongValue] > 0 &&
             (unsigned long long)[json[@"size"] longLongValue] == size) {
-            [self finishFile:file];
+            [self finishFile:file driveID:json[@"id"]];
         } else if (code == 308) {
             NSString *range = [response valueForHTTPHeaderField:@"Range"];
             unsigned long long next = range.length ? [[[range componentsSeparatedByString:@"-"] lastObject] longLongValue] + 1 : 0;
@@ -657,7 +718,7 @@ typedef void (^DriveReply)(NSDictionary *, NSHTTPURLResponse *, NSError *);
             self.recoveringExpiredUpload = YES;
             [file removeObjectForKey:@"session"];
             [self find:key parent:self.active[@"folder"] completion:^(NSDictionary *found) {
-                if ([found[@"id"] length] && [found[@"size"] longLongValue] > 0) [self finishFile:file];
+                if ([found[@"id"] length] && [found[@"size"] longLongValue] > 0) [self finishFile:file driveID:found[@"id"]];
                 else [self upload:file key:key index:index offset:nil];
             }];
         } else {
@@ -718,13 +779,18 @@ static BOOL RefreshMissingMedia(NFBArchiveQueue *queue, NSMutableDictionary *job
     if (job == queue.active || [job[@"state"] isEqualToString:@"complete"]) return NO;
     BOOL refreshed = NO;
     NSArray *oldFiles = job[@"files"];
-    for (NSUInteger index = 1; index < oldFiles.count; index++) {
+    NSUInteger firstMedia = HasTextFile(job) && oldFiles.count ? 1 : 0;
+    NSArray *oldMedia = [oldFiles subarrayWithRange:NSMakeRange(firstMedia, oldFiles.count - firstMedia)];
+    if ([freshFiles.firstObject[@"text"] isKindOfClass:NSString.class]) {
+        freshFiles = [freshFiles subarrayWithRange:NSMakeRange(1, freshFiles.count - 1)];
+    }
+    for (NSUInteger index = firstMedia; index < oldFiles.count; index++) {
         NSMutableDictionary *file = oldFiles[index];
         if ([file[@"done"] boolValue]) continue;
         NSURL *local = [queue localFileForJob:job index:index];
         if ([NSFileManager.defaultManager fileExistsAtPath:local.path] &&
             ([file[@"mime"] length] || DownloadedMediaType(local))) continue;
-        NSDictionary *fresh = MatchingMedia(file, freshFiles, oldFiles);
+        NSDictionary *fresh = MatchingMedia(file, freshFiles, oldMedia);
         if (!fresh || [fresh[@"source"] isEqualToString:file[@"source"]]) continue;
         file[@"source"] = fresh[@"source"];
         file[@"playlist"] = fresh[@"playlist"] ?: @NO;
@@ -888,7 +954,7 @@ void NFBArchiveCaptureSections(id controller, NSArray *sections) {
 }
 
 - (void)openTasks {
-    [self.navigationController pushViewController:NFBArchiveTasks() animated:YES];
+    [self.navigationController pushViewController:ArchiveTaskList() animated:YES];
 }
 
 - (void)stop:(NSString *)state message:(NSString *)message {
@@ -1282,8 +1348,343 @@ void NFBArchiveProfile(UIViewController *presenter, id author,
 }
 @end
 
-UIViewController *NFBArchiveTasks(void) {
+static UIViewController *ArchiveTaskList(void) {
     return [[NFBArchiveTasksController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+}
+
+static NSString *GalleryBody(NSDictionary *job) {
+    NSString *body = job[@"body"];
+    if (body) return body;
+    NSDictionary *textFile = [job[@"files"] firstObject];
+    NSString *legacyText = textFile[@"text"];
+    if (!legacyText) return @"";
+    NSRange separator = [legacyText rangeOfString:@"\n\n"];
+    if (separator.location == NSNotFound) return legacyText;
+    body = [legacyText substringFromIndex:NSMaxRange(separator)];
+    return [body hasSuffix:@"\n"] ? [body substringToIndex:body.length - 1] : body;
+}
+
+static NSString *GalleryTimestamp(NSDictionary *job) {
+    if ([job[@"timestamp"] length]) return job[@"timestamp"];
+    NSArray *lines = [[[job[@"files"] firstObject][@"text"] description] componentsSeparatedByString:@"\n"];
+    return lines.count > 1 ? lines[1] : @"";
+}
+
+static NSUInteger GalleryCover(NSDictionary *job) {
+    NSArray *files = job[@"files"];
+    for (NSUInteger index = HasTextFile(job) ? 1 : 0; index < files.count; index++) {
+        if ([files[index][@"done"] boolValue]) return index;
+    }
+    return NSNotFound;
+}
+
+static NSString *GalleryMediaName(NSDictionary *file) {
+    switch ([file[@"type"] integerValue]) {
+        case 1: return @"照片";
+        case 2: return @"GIF";
+        case 3: return @"视频";
+        default: return @"附件";
+    }
+}
+
+static BOOL GalleryGoogleURL(NSURL *url) {
+    NSString *host = url.host.lowercaseString;
+    return [url.scheme isEqualToString:@"https"] &&
+        ([host isEqualToString:@"www.googleapis.com"] || [host isEqualToString:@"drive.google.com"] ||
+         [host hasSuffix:@".googleusercontent.com"]);
+}
+
+typedef void (^GalleryPreviewReply)(NSString *fileID, UIImage *image);
+
+@interface NFBArchivePreviews : NSObject <NSURLSessionTaskDelegate>
+@property (nonatomic, strong) NSURLSession *session;
+@property (nonatomic, strong) NSCache<NSString *, NSArray *> *cache;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSMutableArray *> *pending;
++ (instancetype)shared;
+- (void)load:(NSDictionary *)job index:(NSUInteger)index completion:(GalleryPreviewReply)completion;
+@end
+
+@implementation NFBArchivePreviews
++ (instancetype)shared {
+    static NFBArchivePreviews *previews;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        previews = [self new];
+        NSURLSessionConfiguration *config = NSURLSessionConfiguration.ephemeralSessionConfiguration;
+        config.HTTPShouldSetCookies = NO;
+        config.URLCredentialStorage = nil;
+        config.URLCache = nil;
+        config.timeoutIntervalForRequest = 20;
+        previews.session = [NSURLSession sessionWithConfiguration:config delegate:previews delegateQueue:nil];
+        previews.cache = [NSCache new];
+        previews.cache.countLimit = 96;
+        previews.pending = [NSMutableDictionary dictionary];
+    });
+    return previews;
+}
+
+- (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task
+    willPerformHTTPRedirection:(NSHTTPURLResponse *)response newRequest:(NSURLRequest *)request
+    completionHandler:(void (^)(NSURLRequest *))completionHandler {
+    if (!GalleryGoogleURL(request.URL)) { completionHandler(nil); return; }
+    NSMutableURLRequest *redirect = [request mutableCopy];
+    if (![response.URL.host isEqualToString:request.URL.host]) {
+        [redirect setValue:nil forHTTPHeaderField:@"Authorization"];
+    }
+    completionHandler(redirect);
+}
+
+- (void)fetch:(NSURL *)url token:(NSString *)token completion:(void (^)(NSData *, NSInteger))completion {
+    if (!GalleryGoogleURL(url)) { completion(nil, 0); return; }
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
+    [request setValue:[@"Bearer " stringByAppendingString:token] forHTTPHeaderField:@"Authorization"];
+    [[self.session dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        NSInteger code = [response isKindOfClass:NSHTTPURLResponse.class] ? [(NSHTTPURLResponse *)response statusCode] : 0;
+        dispatch_async(dispatch_get_main_queue(), ^{ completion(code == 200 ? data : nil, code); });
+    }] resume];
+}
+
+- (void)resolve:(NSDictionary *)job index:(NSUInteger)index retryAuth:(BOOL)retryAuth completion:(GalleryPreviewReply)completion {
+    NSString *account = job[@"account"];
+    if (![account isEqualToString:NFBDriveAuth.shared.account]) { completion(nil, nil); return; }
+    NSDictionary *file = job[@"files"][index];
+    NSString *fileID = file[@"driveID"];
+    NSDictionary *query = fileID.length ? @{@"fields": @"id,thumbnailLink,trashed"} : @{
+        @"q": DriveFileQuery(DriveFileKey(job, index), job[@"folder"]),
+        @"fields": @"files(id,thumbnailLink)", @"pageSize": @"1"};
+    NSString *path = fileID.length ? [@"/drive/v3/files/" stringByAppendingString:fileID] : @"/drive/v3/files";
+    [NFBDriveAuth.shared token:^(NSString *token, NSString *error) {
+        if (!token.length || ![account isEqualToString:NFBDriveAuth.shared.account]) { completion(nil, nil); return; }
+        [self fetch:API(path, query) token:token completion:^(NSData *data, NSInteger code) {
+            if (![account isEqualToString:NFBDriveAuth.shared.account]) { completion(nil, nil); return; }
+            if (code == 401 && retryAuth) {
+                [NFBDriveAuth.shared invalidateAccessToken];
+                [self resolve:job index:index retryAuth:NO completion:completion];
+                return;
+            }
+            id object = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+            NSDictionary *json = [object isKindOfClass:NSDictionary.class] ? object : nil;
+            NSArray *files = [json[@"files"] isKindOfClass:NSArray.class] ? json[@"files"] : nil;
+            NSDictionary *metadata = fileID.length ? json : files.firstObject;
+            NSString *identifier = [metadata[@"id"] isKindOfClass:NSString.class] ? metadata[@"id"] : nil;
+            if (!identifier.length || [metadata[@"trashed"] boolValue]) { completion(nil, nil); return; }
+            NSString *link = [metadata[@"thumbnailLink"] isKindOfClass:NSString.class] ? metadata[@"thumbnailLink"] : nil;
+            if (!link.length) { completion(identifier, nil); return; }
+            [self fetch:[NSURL URLWithString:link] token:token completion:^(NSData *image, NSInteger status) {
+                if (![account isEqualToString:NFBDriveAuth.shared.account]) { completion(nil, nil); return; }
+                completion(identifier, image.length ? [UIImage imageWithData:image] : nil);
+            }];
+        }];
+    }];
+}
+
+- (void)load:(NSDictionary *)job index:(NSUInteger)index completion:(GalleryPreviewReply)completion {
+    NSArray *files = job[@"files"];
+    if (index >= files.count || ![files[index][@"done"] boolValue] || ![job[@"folder"] length] ||
+        ![job[@"account"] isEqualToString:NFBDriveAuth.shared.account]) { completion(nil, nil); return; }
+    NSString *key = [NSString stringWithFormat:@"%@/%@/%lu", job[@"account"], job[@"id"], (unsigned long)index];
+    NSArray *cached = [self.cache objectForKey:key];
+    if (cached && [cached[2] timeIntervalSinceNow] > 0) {
+        completion(cached[0] == NSNull.null ? nil : cached[0], cached[1] == NSNull.null ? nil : cached[1]);
+        return;
+    }
+    if (self.pending[key]) { [self.pending[key] addObject:[completion copy]]; return; }
+    self.pending[key] = [NSMutableArray arrayWithObject:[completion copy]];
+    [self resolve:job index:index retryAuth:YES completion:^(NSString *fileID, UIImage *image) {
+        NSArray *callbacks = self.pending[key];
+        [self.pending removeObjectForKey:key];
+        [self.cache setObject:@[fileID ?: (id)NSNull.null, image ?: (id)NSNull.null,
+            [NSDate dateWithTimeIntervalSinceNow:image ? 600 : 12]] forKey:key];
+        for (GalleryPreviewReply callback in callbacks) callback(fileID, image);
+    }];
+}
+@end
+
+@interface NFBArchiveGalleryCell : UITableViewCell
+@property (nonatomic, strong) NSUUID *configurationID;
+@end
+
+@implementation NFBArchiveGalleryCell
+- (void)prepareForReuse {
+    [super prepareForReuse];
+    self.configurationID = nil;
+}
+@end
+
+@interface NFBArchiveGalleryController : UITableViewController
+@property (nonatomic, copy) NSString *authorID;
+@property (nonatomic, strong) NSDictionary *post;
+@property (nonatomic, copy) NSArray<NSDictionary *> *authors;
+@property (nonatomic, copy) NSArray<NSDictionary *> *posts;
+@end
+
+@implementation NFBArchiveGalleryController
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.tableView.rowHeight = UITableViewAutomaticDimension;
+    self.tableView.estimatedRowHeight = 84;
+    if (!self.authorID && !self.post) {
+        self.title = @"云收藏";
+        self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"任务"
+            style:UIBarButtonItemStylePlain target:self action:@selector(showTasks)];
+    }
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    NSString *account = NFBDriveAuth.shared.account;
+    NSMutableArray *posts = [NSMutableArray array];
+    NSMutableDictionary *groups = [NSMutableDictionary dictionary];
+    NSMutableArray *authors = [NSMutableArray array];
+    NSArray *sorted = [NFBArchiveQueue.shared.jobs sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        return [b[@"post"] compare:a[@"post"] options:NSNumericSearch];
+    }];
+    for (NSDictionary *job in sorted) {
+        if (![job[@"account"] isEqualToString:account] || ![job[@"state"] isEqualToString:@"complete"]) continue;
+        NSString *author = job[@"author"];
+        if (self.authorID) {
+            if ([author isEqualToString:self.authorID]) [posts addObject:job];
+        } else if (!self.post) {
+            NSMutableArray *group = groups[author];
+            if (!group) {
+                group = [NSMutableArray array];
+                groups[author] = group;
+                [authors addObject:@{@"id": author, @"name": job[@"folderName"], @"posts": group}];
+            }
+            [group addObject:job];
+        }
+    }
+    self.authors = authors;
+    self.posts = posts;
+    UILabel *empty = [UILabel new];
+    empty.textAlignment = NSTextAlignmentCenter;
+    empty.textColor = UIColor.secondaryLabelColor;
+    empty.numberOfLines = 0;
+    empty.text = account.length ? @"已完成的收藏会显示在这里。\n可以在「任务」查看上传进度。" : @"请在「任务」中连接 Google Drive。";
+    self.tableView.backgroundView = !self.post && !(self.authorID ? posts.count : authors.count) ? empty : nil;
+    [self.tableView reloadData];
+}
+
+- (void)showTasks {
+    [self.navigationController pushViewController:ArchiveTaskList() animated:YES];
+}
+
+- (NSInteger)tableView:(UITableView *)table numberOfRowsInSection:(NSInteger)section {
+    if (self.post) {
+        NSUInteger count = [self.post[@"files"] count];
+        return section == 0 ? 1 : (HasTextFile(self.post) && count ? count - 1 : count);
+    }
+    return self.authorID ? self.posts.count : self.authors.count;
+}
+
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)table {
+    return self.post ? 2 : 1;
+}
+
+- (NSString *)tableView:(UITableView *)table titleForHeaderInSection:(NSInteger)section {
+    return self.post && section == 1 && [self tableView:table numberOfRowsInSection:section] ? @"附件" : nil;
+}
+
+- (UITableViewCell *)tableView:(UITableView *)table cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    NFBArchiveGalleryCell *cell = [table dequeueReusableCellWithIdentifier:@"gallery"] ?:
+        [[NFBArchiveGalleryCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"gallery"];
+    NSUUID *configurationID = [NSUUID UUID];
+    cell.configurationID = configurationID;
+    UIListContentConfiguration *content = [UIListContentConfiguration subtitleCellConfiguration];
+    content.secondaryTextProperties.color = UIColor.secondaryLabelColor;
+    content.imageProperties.maximumSize = CGSizeMake(80, 80);
+    content.imageProperties.reservedLayoutSize = CGSizeMake(80, 80);
+    content.imageProperties.cornerRadius = 9;
+    cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+    cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+    NSDictionary *job = self.post;
+    NSUInteger index = NSNotFound;
+    if (job && indexPath.section == 0) {
+        NSString *body = GalleryBody(job);
+        content.text = body.length ? body : @"媒体帖";
+        content.textProperties.numberOfLines = 0;
+        content.secondaryText = [@[job[@"folderName"], GalleryTimestamp(job)] componentsJoinedByString:@"\n"];
+        content.secondaryTextProperties.numberOfLines = 0;
+        content.imageProperties.reservedLayoutSize = CGSizeZero;
+        cell.accessoryType = UITableViewCellAccessoryNone;
+        cell.selectionStyle = UITableViewCellSelectionStyleNone;
+    } else if (job) {
+        index = indexPath.row + (HasTextFile(job) ? 1 : 0);
+        NSDictionary *file = job[@"files"][index];
+        content.text = [NSString stringWithFormat:@"%@ %02lu", GalleryMediaName(file), (unsigned long)DriveFileIndex(job, index)];
+        content.secondaryText = @"在 Google Drive 打开";
+    } else if (self.authorID) {
+        job = self.posts[indexPath.row];
+        NSString *body = GalleryBody(job);
+        content.text = body.length ? body : @"媒体帖";
+        content.textProperties.numberOfLines = 2;
+        index = GalleryCover(job);
+        NSString *timestamp = GalleryTimestamp(job);
+        content.secondaryText = timestamp.length ? timestamp : [job[@"prefix"] componentsSeparatedByString:@" "].firstObject;
+    } else {
+        NSDictionary *group = self.authors[indexPath.row];
+        NSArray *posts = group[@"posts"];
+        content.text = group[@"name"];
+        content.secondaryText = [NSString stringWithFormat:@"%lu 条收藏", (unsigned long)posts.count];
+        for (NSDictionary *candidate in posts) {
+            index = GalleryCover(candidate);
+            if (index != NSNotFound) { job = candidate; break; }
+        }
+    }
+    if (cell.selectionStyle != UITableViewCellSelectionStyleNone) {
+        NSNumber *type = index == NSNotFound ? nil : job[@"files"][index][@"type"];
+        NSString *icon = index == NSNotFound ? (self.authorID ? @"doc.text" : @"person.crop.square") :
+            (type.integerValue > 1 ? @"play.rectangle" : @"photo");
+        content.image = [UIImage systemImageNamed:icon];
+    }
+    cell.contentConfiguration = content;
+    if (index != NSNotFound) {
+        __weak NFBArchiveGalleryCell *weakCell = cell;
+        [NFBArchivePreviews.shared load:job index:index completion:^(NSString *fileID, UIImage *image) {
+            NFBArchiveGalleryCell *current = weakCell;
+            if (!image || current.configurationID != configurationID) return;
+            UIListContentConfiguration *updated = [content copy];
+            updated.image = image;
+            current.contentConfiguration = updated;
+        }];
+    }
+    return cell;
+}
+
+- (void)tableView:(UITableView *)table didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    [table deselectRowAtIndexPath:indexPath animated:YES];
+    if (self.post) {
+        if (indexPath.section != 1) return;
+        NSUInteger index = indexPath.row + (HasTextFile(self.post) ? 1 : 0);
+        __weak typeof(self) weakSelf = self;
+        [NFBArchivePreviews.shared load:self.post index:index completion:^(NSString *fileID, UIImage *image) {
+            NFBArchiveGalleryController *controller = weakSelf;
+            if (controller.navigationController.topViewController != controller || !controller.viewIfLoaded.window) return;
+            if (!fileID.length || [fileID rangeOfCharacterFromSet:
+                    [[NSCharacterSet characterSetWithCharactersInString:@"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"] invertedSet]].location != NSNotFound) {
+                Message(controller, @"无法打开附件", @"请检查网络、Google 账号或 Drive 中的文件。");
+                return;
+            }
+            NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"https://drive.google.com/file/d/%@/view", fileID]];
+            [UIApplication.sharedApplication openURL:url options:@{} completionHandler:nil];
+        }];
+        return;
+    }
+    NFBArchiveGalleryController *next = [[NFBArchiveGalleryController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+    if (self.authorID) {
+        next.post = self.posts[indexPath.row];
+        next.title = @"帖子详情";
+    } else {
+        NSDictionary *group = self.authors[indexPath.row];
+        next.authorID = group[@"id"];
+        next.title = group[@"name"];
+    }
+    [self.navigationController pushViewController:next animated:YES];
+}
+@end
+
+UIViewController *NFBArchiveGallery(void) {
+    return [[NFBArchiveGalleryController alloc] initWithStyle:UITableViewStyleInsetGrouped];
 }
 
 void NFBArchivePost(UIViewController *presenter, id status) {
@@ -1322,7 +1723,7 @@ void NFBArchivePost(UIViewController *presenter, id status) {
         }
         [queue run];
         if (presenter.view.window && !presenter.presentedViewController) {
-            [presenter presentViewController:[[UINavigationController alloc] initWithRootViewController:NFBArchiveTasks()] animated:YES completion:nil];
+            [presenter presentViewController:[[UINavigationController alloc] initWithRootViewController:ArchiveTaskList()] animated:YES completion:nil];
         }
     };
     if (NFBDriveAuth.shared.account.length) enqueue();

@@ -42,6 +42,11 @@ on:
         default: true
         required: false
         type: boolean
+      ipa_build_number:
+        description: "Optional numeric build number for a versioned SideStore IPA"
+        default: ""
+        required: false
+        type: string
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -153,12 +158,23 @@ jobs:
           echo "$X_VERSION"
           if [ -n "$NFB_DRIVE_IOS_CLIENT_ID" ]; then
             python3 main/tools/configure-drive-oauth.py
+          fi
+          if [ -n "$IPA_BUILD_NUMBER" ]; then
+            if [[ ! "$IPA_BUILD_NUMBER" =~ ^[1-9][0-9]{0,3}$ ]]; then
+              echo "::error::IPA build number must be an integer from 1 to 9999."
+              exit 1
+            fi
+            /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $IPA_BUILD_NUMBER" "$INFO_PLIST"
+            echo "build_suffix=_build${IPA_BUILD_NUMBER}" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -n "$NFB_DRIVE_IOS_CLIENT_ID$IPA_BUILD_NUMBER" ]; then
             (cd main/tmp && zip -q ../packages/com.atebits.Tweetie2.ipa Payload/Twitter.app/Info.plist)
           fi
         env:
           IPA_URL: ${{ secrets.NFB_DECRYPTED_IPA_URL }}
           NFB_DRIVE_IOS_CLIENT_ID: ${{ vars.NFB_DRIVE_IOS_CLIENT_ID }}
           NFB_DRIVE_IOS_BUNDLE_ID: ${{ vars.NFB_DRIVE_IOS_BUNDLE_ID }}
+          IPA_BUILD_NUMBER: ${{ inputs.ipa_build_number }}
 
       - name: Prepare Image Pack
         if: inputs.resource_pack_url != '' && (inputs.deploy_format == 'sideloaded' || inputs.deploy_format == 'trollstore')
@@ -202,7 +218,7 @@ jobs:
         if: inputs.deploy_format == 'sideloaded' || inputs.deploy_format == 'trollstore'
         run: |
           mv "main/packages/$(ls -t main/packages | head -n1)" \
-             "main/packages/${{ steps.tweak_info.outputs.name }}-${BRANDING}-${{ inputs.deploy_format }}_${{ steps.tweak_info.outputs.version }}_${{ steps.x_version.outputs.version }}.${IPA_EXT}"
+             "main/packages/${{ steps.tweak_info.outputs.name }}-${BRANDING}-${{ inputs.deploy_format }}_${{ steps.tweak_info.outputs.version }}_${{ steps.x_version.outputs.version }}${{ steps.x_version.outputs.build_suffix }}.${IPA_EXT}"
         env:
           IPA_EXT: ${{ inputs.deploy_format == 'trollstore' && 'tipa' || 'ipa' }}
           BRANDING: ${{ inputs.twitter_branding && 'Twitter' || 'X' }}
@@ -220,7 +236,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: v${{ steps.tweak_info.outputs.version }}
-          name: v${{ steps.tweak_info.outputs.version }} - ${{ steps.tweak_info.outputs.name }}
+          tag_name: ${{ steps.x_version.outputs.build_suffix != '' && format('sidestore-x-{0}-r{1}', steps.x_version.outputs.version, inputs.ipa_build_number) || format('v{0}', steps.tweak_info.outputs.version) }}
+          target_commitish: ${{ inputs.commit_id || github.sha }}
+          name: ${{ steps.x_version.outputs.build_suffix != '' && format('NeoFreeBird X {0} · Build {1}', steps.x_version.outputs.version, inputs.ipa_build_number) || format('v{0} - {1}', steps.tweak_info.outputs.version, steps.tweak_info.outputs.name) }}
           files: main/packages/${{ steps.package_name.outputs.package }}
           draft: true

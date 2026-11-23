@@ -218,7 +218,7 @@
             @"action": @"showDownloadsSettings"
         },
         @{
-            @"title": @"云收藏任务",
+            @"title": @"云收藏",
             @"subtitle": @"查看进度、继续或重试 Google Drive 收藏",
             @"icon": @"bookmark_stroke",
             @"action": @"showArchiveTasks"
@@ -458,7 +458,12 @@
 
     UILabel* footerLabel = [[UILabel alloc] init];
     footerLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    footerLabel.text = @NFB_VERSION_STRING " (" NFB_COMMIT_STRING ")";
+    NSDictionary *info = NSBundle.mainBundle.infoDictionary;
+    NSString *build = info[@"CFBundleVersion"];
+    footerLabel.text = build.length
+        ? [NSString stringWithFormat:@"%@ · %@ (%@)\n%s", @NFB_VERSION_STRING,
+           info[@"CFBundleShortVersionString"] ?: @"X", build, NFB_COMMIT_STRING]
+        : @NFB_VERSION_STRING " (" NFB_COMMIT_STRING ")";
     footerLabel.numberOfLines = 0;
     footerLabel.textAlignment = NSTextAlignmentLeft;
     footerLabel.userInteractionEnabled = YES;
@@ -687,7 +692,7 @@
 #pragma mark - UITableViewDelegate
 
 - (void)showArchiveTasks {
-    [self.navigationController pushViewController:NFBArchiveTasks() animated:YES];
+    [self.navigationController pushViewController:NFBArchiveGallery() animated:YES];
 }
 
 - (void)tableView:(UITableView*)tableView didSelectRowAtIndexPath:(NSIndexPath*)indexPath {
