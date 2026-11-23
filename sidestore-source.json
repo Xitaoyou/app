@@ -17,6 +17,14 @@
           "size": 281661355,
           "minOSVersion": "15.0",
           "localizedDescription": "统一 Media 标签。修复云收藏链接更新、下载恢复和批量归档的完成统计。"
+        },
+        {
+          "version": "10.79.2",
+          "date": "2026-11-23T12:19:05Z",
+          "downloadURL": "https://github.com/Xitaoyou/app/releases/download/legacy-x-10.79.2-nfb-7.3.1-r1/NeoFreeBird-Legacy-sideloaded_7.3.1_10.79.2.ipa",
+          "size": 163888342,
+          "minOSVersion": "15.0",
+          "localizedDescription": "旧版兼容版。移植 NeoFreeBird 7.3.1 核心功能，使用 X 10.79.2 原生 Media。"
         }
       ]
     }
