@@ -1,0 +1,25 @@
+{
+  "name": "NeoFreeBird X · Xitaoyou",
+  "identifier": "io.github.xitaoyou.neofreebird.x",
+  "iconURL": "https://raw.githubusercontent.com/Xitaoyou/app/271467c147f5d5bd83c7254fa82041b85d154ede/resources/x_icon_rounded.png",
+  "apps": [
+    {
+      "name": "NeoFreeBird X",
+      "bundleIdentifier": "com.atebits.Tweetie2",
+      "developerName": "Xitaoyou / NeoFreeBird contributors",
+      "localizedDescription": "X 12.42.1 的 NeoFreeBird 侧载版，包含统一 Media 标签与 Google Drive 云收藏。Google Drive 集成当前限已获授权的测试账号。",
+      "iconURL": "https://raw.githubusercontent.com/Xitaoyou/app/271467c147f5d5bd83c7254fa82041b85d154ede/resources/x_icon_rounded.png",
+      "versions": [
+        {
+          "version": "12.42.1",
+          "date": "2026-11-22T18:06:35Z",
+          "downloadURL": "https://github.com/Xitaoyou/app/releases/download/sidestore-x-12.42.1-r1/NeoFreeBird-Twitter-sideloaded_7.3.1_12.42.1.ipa",
+          "size": 281661355,
+          "minOSVersion": "15.0",
+          "localizedDescription": "统一 Media 标签。修复云收藏链接更新、下载恢复和批量归档的完成统计。"
+        }
+      ]
+    }
+  ],
+  "news": []
+}
