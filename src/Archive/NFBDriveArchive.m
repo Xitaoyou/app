@@ -1530,14 +1530,21 @@ static void ConfirmRemoval(UIViewController *presenter, NSMutableDictionary *tar
     UIAlertAction *cloud = [UIAlertAction actionWithTitle:@"本机和 Drive 一起删除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
         dispatch_async(dispatch_get_main_queue(), ^{
             UIBarButtonItem *button = presenter.navigationItem.rightBarButtonItem;
+            UIBarButtonItem *left = presenter.navigationItem.leftBarButtonItem;
             NSString *previousTitle = button.title;
+            BOOL leftWasEnabled = left.enabled;
+            BOOL viewWasInteractive = presenter.view.userInteractionEnabled;
             button.enabled = NO;
+            left.enabled = NO;
+            presenter.view.userInteractionEnabled = NO;
             button.title = @"处理中…";
             void (^finish)(NSString *) = ^(NSString *error) {
                 button.enabled = YES;
+                left.enabled = leftWasEnabled;
+                presenter.view.userInteractionEnabled = viewWasInteractive;
                 button.title = previousTitle;
                 if (error) {
-                    if ([presenter isKindOfClass:UITableViewController.class]) {
+                    if ([presenter isKindOfClass:UITableViewController.class] && ![(UITableViewController *)presenter isEditing]) {
                         [[(UITableViewController *)presenter tableView] reloadData];
                     }
                     Message(presenter, @"Drive 删除未完成", [error stringByAppendingString:@" 本机记录仍保留，可重新打开删除菜单重试。"]);
@@ -1559,18 +1566,189 @@ static void ConfirmArchiveRemoval(UIViewController *presenter, NSMutableDictiona
     ConfirmRemoval(presenter, job, NO, removed);
 }
 
-static UIContextMenuConfiguration *ArchiveRemovalMenu(NSString *title, dispatch_block_t handler) {
-    return [UIContextMenuConfiguration configurationWithIdentifier:nil previewProvider:nil actionProvider:^UIMenu *(NSArray<UIMenuElement *> *suggested) {
-        UIAction *remove = [UIAction actionWithTitle:title image:[UIImage systemImageNamed:@"trash"] identifier:nil handler:^(UIAction *action) {
-            handler();
-        }];
-        remove.attributes = UIMenuElementAttributesDestructive;
-        return [UIMenu menuWithTitle:@"" children:@[remove]];
-    }];
+static NSDictionary *ArchiveSelection(NSMutableDictionary *item, BOOL author) {
+    return item ? @{@"item": item, @"authorScope": @(author)} : nil;
 }
 
-@interface NFBArchiveTasksController : UITableViewController
+static NSString *SelectionAuthorKey(NSDictionary *item) {
+    return [NSString stringWithFormat:@"%@/%@", item[@"account"], item[@"author"]];
+}
+
+static NSArray<NSDictionary *> *UniqueArchiveSelections(NSArray<NSDictionary *> *rows) {
+    NSMutableSet *authors = [NSMutableSet set];
+    for (NSDictionary *row in rows) if ([row[@"authorScope"] boolValue]) [authors addObject:SelectionAuthorKey(row[@"item"])];
+    NSMutableSet *seen = [NSMutableSet set];
+    NSMutableArray *result = [NSMutableArray array];
+    for (NSDictionary *row in rows) {
+        NSDictionary *item = row[@"item"];
+        BOOL wholeAuthor = [row[@"authorScope"] boolValue];
+        NSString *authorKey = SelectionAuthorKey(item);
+        if (!wholeAuthor && [authors containsObject:authorKey]) continue;
+        NSString *key = wholeAuthor ? authorKey : item[@"id"];
+        if (key.length && ![seen containsObject:key]) {
+            [seen addObject:key];
+            [result addObject:row];
+        }
+    }
+    return result;
+}
+
+static NSString *SelectionBlocker(NSArray<NSDictionary *> *rows) {
+    NFBArchiveQueue *queue = NFBArchiveQueue.shared;
+    for (NSDictionary *row in rows) {
+        NSString *blocked = [row[@"authorScope"] boolValue] ? [queue authorRemovalBlocker:row[@"item"]] : [queue removalBlocker:row[@"item"]];
+        if (blocked) return blocked;
+    }
+    return nil;
+}
+
+static void TrashSelectedArchives(NSArray<NSDictionary *> *rows, NSUInteger index, void (^completion)(NSString *)) {
+    if (index == rows.count) { completion(nil); return; }
+    NSDictionary *row = rows[index];
+    NFBArchiveQueue *queue = NFBArchiveQueue.shared;
+    void (^next)(NSString *) = ^(NSString *error) {
+        if (error) {
+            completion([NSString stringWithFormat:@"已处理 %lu/%lu 项。%@", (unsigned long)index, (unsigned long)rows.count, error]);
+        } else {
+            dispatch_async(dispatch_get_main_queue(), ^{ TrashSelectedArchives(rows, index + 1, completion); });
+        }
+    };
+    if ([row[@"authorScope"] boolValue]) [queue trashAuthor:row[@"item"] completion:next];
+    else [queue trashArchive:row[@"item"] completion:next];
+}
+
+@interface NFBArchiveSelectionController : UITableViewController
+@property (nonatomic, strong) UIBarButtonItem *selectionPreviousLeft;
+@property (nonatomic, strong) UIBarButtonItem *selectionPreviousRight;
+@property (nonatomic) BOOL selectionBusy;
+- (NSDictionary *)archiveSelectionAtIndexPath:(NSIndexPath *)path;
+- (void)archiveSelectionBegan;
+- (void)archiveSelectionEnded;
+- (void)updateArchiveSelection;
+@end
+
+@implementation NFBArchiveSelectionController
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.tableView.allowsMultipleSelectionDuringEditing = YES;
+    UILongPressGestureRecognizer *press = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(selectArchiveFromPress:)];
+    [self.tableView addGestureRecognizer:press];
+}
+
+- (NSDictionary *)archiveSelectionAtIndexPath:(NSIndexPath *)path { return nil; }
+- (void)archiveSelectionBegan {}
+- (void)archiveSelectionEnded { [self.tableView reloadData]; }
+
+- (void)selectArchiveFromPress:(UILongPressGestureRecognizer *)press {
+    if (press.state != UIGestureRecognizerStateBegan || self.isEditing || self.selectionBusy) return;
+    NSIndexPath *path = [self.tableView indexPathForRowAtPoint:[press locationInView:self.tableView]];
+    if (!path || ![self archiveSelectionAtIndexPath:path]) return;
+    self.selectionPreviousLeft = self.navigationItem.leftBarButtonItem;
+    self.selectionPreviousRight = self.navigationItem.rightBarButtonItem;
+    [self archiveSelectionBegan];
+    [self setEditing:YES animated:YES];
+    self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemCancel
+        target:self action:@selector(endArchiveSelection)];
+    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"删除"
+        style:UIBarButtonItemStylePlain target:self action:@selector(removeArchiveSelection)];
+    self.navigationItem.rightBarButtonItem.tintColor = UIColor.systemRedColor;
+    [self.tableView selectRowAtIndexPath:path animated:NO scrollPosition:UITableViewScrollPositionNone];
+    [self updateArchiveSelection];
+}
+
+- (NSArray<NSDictionary *> *)selectedArchives {
+    NSMutableArray *selected = [NSMutableArray array];
+    for (NSIndexPath *path in self.tableView.indexPathsForSelectedRows) {
+        NSDictionary *row = [self archiveSelectionAtIndexPath:path];
+        if (row) [selected addObject:row];
+    }
+    return UniqueArchiveSelections(selected);
+}
+
+- (void)updateArchiveSelection {
+    NSUInteger count = [self selectedArchives].count;
+    self.navigationItem.rightBarButtonItem.enabled = count > 0 && !self.selectionBusy;
+    self.navigationItem.rightBarButtonItem.title = count ? [NSString stringWithFormat:@"删除 (%lu)", (unsigned long)count] : @"删除";
+}
+
+- (void)endArchiveSelection {
+    [self setEditing:NO animated:YES];
+    self.navigationItem.leftBarButtonItem = self.selectionPreviousLeft;
+    self.navigationItem.rightBarButtonItem = self.selectionPreviousRight;
+    self.selectionPreviousLeft = nil;
+    self.selectionPreviousRight = nil;
+    [self archiveSelectionEnded];
+}
+
+- (void)tableView:(UITableView *)table didDeselectRowAtIndexPath:(NSIndexPath *)path {
+    if (self.isEditing) [self updateArchiveSelection];
+}
+
+- (void)removeArchiveSelection {
+    if (self.selectionBusy) return;
+    NSArray<NSDictionary *> *rows = [self selectedArchives];
+    if (!rows.count) return;
+    NSString *blocked = SelectionBlocker(rows);
+    if (blocked) { Message(self, @"暂时无法删除", blocked); return; }
+    if (rows.count == 1) {
+        NSDictionary *row = rows.firstObject;
+        ConfirmRemoval(self, row[@"item"], [row[@"authorScope"] boolValue], ^{ [self endArchiveSelection]; });
+        return;
+    }
+    NSString *message = @"「仅删除本机记录」保留 Drive 文件。\n「本机和 Drive 一起删除」还会把所选帖子的归档文件，以及所选博主的 Drive 归档文件移到回收站。";
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:[NSString stringWithFormat:@"删除所选 %lu 项？", (unsigned long)rows.count]
+        message:message preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"仅删除本机记录" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            NSString *error = SelectionBlocker(rows);
+            if (error) { Message(self, @"暂时无法删除", error); return; }
+            NFBArchiveQueue *queue = NFBArchiveQueue.shared;
+            NSUInteger index = 0;
+            for (NSDictionary *row in rows) {
+                BOOL removed = [row[@"authorScope"] boolValue] ? [queue removeAuthor:row[@"item"]] : [queue removeRecord:row[@"item"]];
+                if (!removed) break;
+                index++;
+            }
+            [self endArchiveSelection];
+            if (index < rows.count) Message(self, @"删除未完成", [NSString stringWithFormat:@"已删除 %lu/%lu 项，其他记录仍保留。",
+                (unsigned long)index, (unsigned long)rows.count]);
+        });
+    }]];
+    UIAlertAction *cloud = [UIAlertAction actionWithTitle:@"本机和 Drive 一起删除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            NSString *error = SelectionBlocker(rows);
+            if (error) { Message(self, @"暂时无法删除", error); return; }
+            self.selectionBusy = YES;
+            self.tableView.allowsSelection = NO;
+            self.navigationItem.leftBarButtonItem.enabled = NO;
+            self.navigationItem.rightBarButtonItem.enabled = NO;
+            self.navigationItem.rightBarButtonItem.title = @"处理中…";
+            TrashSelectedArchives(rows, 0, ^(NSString *failure) {
+                self.selectionBusy = NO;
+                self.tableView.allowsSelection = YES;
+                self.navigationItem.leftBarButtonItem.enabled = YES;
+                [self endArchiveSelection];
+                if (failure) Message(self, @"Drive 删除未完成", [failure stringByAppendingString:@" 未完成的记录可以重新选择重试。"]);
+            });
+        });
+    }];
+    for (NSDictionary *row in rows) {
+        if (![row[@"item"][@"account"] isEqual:NFBDriveAuth.shared.account]) {
+            cloud.enabled = NO;
+            alert.message = [message stringByAppendingString:@"\n\n同时删除 Drive 的文件时，所选项目必须属于当前连接的 Google 账号。"];
+            break;
+        }
+    }
+    [alert addAction:cloud];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+@end
+
+@interface NFBArchiveTasksController : NFBArchiveSelectionController
 @property (nonatomic, strong) NSTimer *progressTimer;
+@property (nonatomic, copy) NSArray *selectionBatches;
+@property (nonatomic, copy) NSArray *selectionJobs;
 @end
 
 @implementation NFBArchiveTasksController
@@ -1584,7 +1762,7 @@ static UIContextMenuConfiguration *ArchiveRemovalMenu(NSString *title, dispatch_
 
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
-    if (self.navigationController.viewControllers.firstObject == self &&
+    if (!self.isEditing && self.navigationController.viewControllers.firstObject == self &&
         self.navigationController.presentingViewController) {
         self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc]
             initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(close)];
@@ -1593,7 +1771,7 @@ static UIContextMenuConfiguration *ArchiveRemovalMenu(NSString *title, dispatch_
     self.progressTimer = [NSTimer scheduledTimerWithTimeInterval:1 repeats:YES block:^(NSTimer *timer) {
         NFBArchiveTasksController *controller = weakSelf;
         if (!controller) { [timer invalidate]; return; }
-        if ([NFBArchiveQueue.shared.network isKindOfClass:NSURLSessionDownloadTask.class]) {
+        if (!controller.isEditing && [NFBArchiveQueue.shared.network isKindOfClass:NSURLSessionDownloadTask.class]) {
             [controller.tableView reloadData];
         }
     }];
@@ -1606,7 +1784,7 @@ static UIContextMenuConfiguration *ArchiveRemovalMenu(NSString *title, dispatch_
 }
 
 - (void)dealloc { [NSNotificationCenter.defaultCenter removeObserver:self]; }
-- (void)refresh:(NSNotification *)note { [self.tableView reloadData]; }
+- (void)refresh:(NSNotification *)note { if (!self.isEditing) [self.tableView reloadData]; }
 - (void)close { [self dismissViewControllerAnimated:YES completion:nil]; }
 - (void)connect {
     [NFBDriveAuth.shared authorizeFrom:self completion:^(NSString *error) {
@@ -1615,7 +1793,23 @@ static UIContextMenuConfiguration *ArchiveRemovalMenu(NSString *title, dispatch_
 }
 
 - (NSInteger)tableView:(UITableView *)table numberOfRowsInSection:(NSInteger)section {
-    return section == 0 ? NFBArchiveQueue.shared.batches.count : NFBArchiveQueue.shared.jobs.count;
+    return [self rowsForArchiveSection:section].count;
+}
+
+- (NSArray *)rowsForArchiveSection:(NSInteger)section {
+    NFBArchiveQueue *queue = NFBArchiveQueue.shared;
+    return section == 0 ? (self.selectionBatches ?: queue.batches) : (self.selectionJobs ?: queue.jobs);
+}
+
+- (void)archiveSelectionBegan {
+    self.selectionBatches = NFBArchiveQueue.shared.batches;
+    self.selectionJobs = NFBArchiveQueue.shared.jobs;
+}
+
+- (void)archiveSelectionEnded {
+    self.selectionBatches = nil;
+    self.selectionJobs = nil;
+    [super archiveSelectionEnded];
 }
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)table { return 2; }
@@ -1656,12 +1850,12 @@ static UIContextMenuConfiguration *ArchiveRemovalMenu(NSString *title, dispatch_
     cell.detailTextLabel.numberOfLines = 2;
     cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
     if (indexPath.section == 0) {
-        NSDictionary *batch = NFBArchiveQueue.shared.batches[indexPath.row];
+        NSDictionary *batch = [self rowsForArchiveSection:indexPath.section][indexPath.row];
         cell.textLabel.text = [NSString stringWithFormat:@"%@ (@%@)", batch[@"name"], batch[@"handle"]];
         cell.detailTextLabel.text = [self batchDetails:batch];
         return cell;
     }
-    NSDictionary *job = NFBArchiveQueue.shared.jobs[indexPath.row];
+    NSDictionary *job = [self rowsForArchiveSection:indexPath.section][indexPath.row];
     NSUInteger done = 0;
     for (NSDictionary *file in job[@"files"]) if ([file[@"done"] boolValue]) done++;
     cell.textLabel.text = job[@"prefix"];
@@ -1724,7 +1918,7 @@ static UIContextMenuConfiguration *ArchiveRemovalMenu(NSString *title, dispatch_
 }
 
 - (UISwipeActionsConfiguration *)tableView:(UITableView *)table trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
-    if (indexPath.section != 1) return nil;
+    if (self.isEditing || indexPath.section != 1) return nil;
     NSMutableDictionary *job = NFBArchiveQueue.shared.jobs[indexPath.row];
     UIContextualAction *remove = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleDestructive
         title:@"删除…" handler:^(UIContextualAction *action, UIView *view, void (^completion)(BOOL)) {
@@ -1736,20 +1930,14 @@ static UIContextMenuConfiguration *ArchiveRemovalMenu(NSString *title, dispatch_
     return config;
 }
 
-- (UIContextMenuConfiguration *)tableView:(UITableView *)table contextMenuConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath point:(CGPoint)point {
-    NFBArchiveQueue *queue = NFBArchiveQueue.shared;
-    BOOL wholeAuthor = indexPath.section == 0;
-    NSArray *rows = wholeAuthor ? queue.batches : queue.jobs;
+- (NSDictionary *)archiveSelectionAtIndexPath:(NSIndexPath *)indexPath {
+    NSArray *rows = [self rowsForArchiveSection:indexPath.section];
     if (indexPath.row >= rows.count) return nil;
-    NSMutableDictionary *target = rows[indexPath.row];
-    __weak typeof(self) weakSelf = self;
-    return ArchiveRemovalMenu(wholeAuthor ? @"删除该博主的全部收藏…" : @"删除收藏…", ^{
-        NFBArchiveTasksController *controller = weakSelf;
-        if (controller) ConfirmRemoval(controller, target, wholeAuthor, ^{ [controller.tableView reloadData]; });
-    });
+    return ArchiveSelection(rows[indexPath.row], indexPath.section == 0);
 }
 
 - (void)tableView:(UITableView *)table didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (self.isEditing) { [self updateArchiveSelection]; return; }
     [table deselectRowAtIndexPath:indexPath animated:YES];
     NFBArchiveQueue *queue = NFBArchiveQueue.shared;
     if (indexPath.section == 0) {
@@ -1947,7 +2135,7 @@ typedef void (^GalleryPreviewReply)(NSString *fileID, UIImage *image);
 }
 @end
 
-@interface NFBArchiveGalleryController : UITableViewController
+@interface NFBArchiveGalleryController : NFBArchiveSelectionController
 @property (nonatomic, copy) NSString *authorID;
 @property (nonatomic, copy) NSString *authorAccount;
 @property (nonatomic, strong) NSMutableDictionary *post;
@@ -1979,7 +2167,7 @@ typedef void (^GalleryPreviewReply)(NSString *fileID, UIImage *image);
 
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
-    [self refreshContent];
+    if (!self.isEditing) [self refreshContent];
 }
 
 - (void)refreshContent {
@@ -2034,26 +2222,24 @@ typedef void (^GalleryPreviewReply)(NSString *fileID, UIImage *image);
     });
 }
 
-- (UIContextMenuConfiguration *)tableView:(UITableView *)table contextMenuConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath point:(CGPoint)point {
-    __weak typeof(self) weakSelf = self;
-    if (self.post) {
-        return ArchiveRemovalMenu(@"删除整条收藏…", ^{ [weakSelf removePost]; });
-    }
+- (NSDictionary *)archiveSelectionAtIndexPath:(NSIndexPath *)indexPath {
+    if (self.post) return ArchiveSelection(self.post, NO);
     if (self.authorID) {
         if (indexPath.row >= self.posts.count) return nil;
-        NSMutableDictionary *job = self.posts[indexPath.row];
-        return ArchiveRemovalMenu(@"删除收藏…", ^{
-            NFBArchiveGalleryController *controller = weakSelf;
-            if (controller) ConfirmArchiveRemoval(controller, job, ^{ [controller refreshContent]; });
-        });
+        return ArchiveSelection(self.posts[indexPath.row], NO);
     }
     if (indexPath.row >= self.authors.count || !NFBDriveAuth.shared.account.length) return nil;
     NSDictionary *row = self.authors[indexPath.row];
     NSMutableDictionary *author = [@{@"account": NFBDriveAuth.shared.account, @"author": row[@"id"], @"name": row[@"name"]} mutableCopy];
-    return ArchiveRemovalMenu(@"删除该博主的全部收藏…", ^{
-        NFBArchiveGalleryController *controller = weakSelf;
-        if (controller) ConfirmRemoval(controller, author, YES, ^{ [controller refreshContent]; });
-    });
+    return ArchiveSelection(author, YES);
+}
+
+- (void)archiveSelectionEnded {
+    if (self.post && ![NFBArchiveQueue.shared.jobs containsObject:self.post]) {
+        if (self.navigationController.topViewController == self) [self.navigationController popViewControllerAnimated:YES];
+        return;
+    }
+    [self refreshContent];
 }
 
 - (NSInteger)tableView:(UITableView *)table numberOfRowsInSection:(NSInteger)section {
@@ -2142,6 +2328,7 @@ typedef void (^GalleryPreviewReply)(NSString *fileID, UIImage *image);
 }
 
 - (void)tableView:(UITableView *)table didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (self.isEditing) { [self updateArchiveSelection]; return; }
     [table deselectRowAtIndexPath:indexPath animated:YES];
     if (self.post) {
         if (indexPath.section != 1) return;
