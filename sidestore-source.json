@@ -12,6 +12,15 @@
       "versions": [
         {
           "version": "12.42.1",
+          "buildVersion": "6",
+          "date": "2026-11-23T23:12:07Z",
+          "downloadURL": "https://github.com/Xitaoyou/app/releases/download/sidestore-x-12.42.1-r6/NeoFreeBird-Twitter-sideloaded_7.3.1_12.42.1_build6.ipa",
+          "size": 281723364,
+          "minOSVersion": "15.0",
+          "localizedDescription": "修复主页归档一路分页超时后另一路一直等待的问题。视频优先保存 X 提供的高分辨率、高码率版本。"
+        },
+        {
+          "version": "12.42.1",
           "buildVersion": "5",
           "date": "2026-11-23T22:38:18Z",
           "downloadURL": "https://github.com/Xitaoyou/app/releases/download/sidestore-x-12.42.1-r5/NeoFreeBird-Twitter-sideloaded_7.3.1_12.42.1_build5.ipa",
